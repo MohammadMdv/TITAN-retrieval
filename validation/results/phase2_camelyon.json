@@ -1,0 +1,33 @@
+{
+  "n_slides": 100,
+  "n_normal": 60,
+  "n_tumor": 40,
+  "zero_shot": {
+    "acc": 0.41,
+    "bacc": 0.5083333333333333,
+    "kappa": 0.013377926421404673,
+    "nw_kappa": 0.013377926421404673,
+    "weighted_f1": 0.24988795848567047,
+    "loss": -1.0,
+    "auroc": -1.0
+  },
+  "linear_probe": {
+    "acc": 0.9,
+    "bacc": 0.9027777777777777,
+    "kappa": 0.7945205479452054,
+    "nw_kappa": 0.7945205479452054,
+    "weighted_f1": 0.9005714285714286,
+    "loss": 0.6132019611526778,
+    "auroc": 0.962962962962963
+  },
+  "linear_probe_bootstrap": {
+    "acc": "0.9003 \u00b1 0.0548",
+    "bacc": "0.9027 \u00b1 0.0557",
+    "kappa": "0.7900 \u00b1 0.1146",
+    "nw_kappa": "0.7900 \u00b1 0.1146",
+    "weighted_f1": "0.9009 \u00b1 0.0543",
+    "loss": "0.6070 \u00b1 0.4296",
+    "auroc": "0.9633 \u00b1 0.0394"
+  },
+  "note": "CAMELYON16 is not a TITAN-designed task; zero-shot indicative only."
+}

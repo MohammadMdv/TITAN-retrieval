@@ -1,0 +1,47 @@
+{
+  "rows": [
+    {
+      "batch_size": 8,
+      "filled": true,
+      "ok": true,
+      "peak_alloc_gb": 0.036280832,
+      "peak_reserved_gb": 0.048234496,
+      "reason": null
+    },
+    {
+      "batch_size": 16,
+      "filled": true,
+      "ok": true,
+      "peak_alloc_gb": 0.0363136,
+      "peak_reserved_gb": 0.048234496,
+      "reason": null
+    },
+    {
+      "batch_size": 32,
+      "filled": true,
+      "ok": true,
+      "peak_alloc_gb": 0.036379136,
+      "peak_reserved_gb": 0.048234496,
+      "reason": null
+    },
+    {
+      "batch_size": 64,
+      "filled": true,
+      "ok": true,
+      "peak_alloc_gb": 0.036510208,
+      "peak_reserved_gb": 0.048234496,
+      "reason": null
+    },
+    {
+      "batch_size": 128,
+      "filled": false,
+      "ok": null,
+      "peak_alloc_gb": null,
+      "peak_reserved_gb": null,
+      "reason": "class imbalance: needs 64 tumor slides, only 40 available (pool caps balanced batch at 80)"
+    }
+  ],
+  "max_balanced_batch": 80,
+  "largest_batch_under_budget": 64,
+  "vram_budget_gb": 20.0
+}

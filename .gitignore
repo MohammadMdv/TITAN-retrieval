@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Large/binary run artifacts (checkpoints, cached embeddings) -- keep the small JSON
+# metric summaries in validation/results/, but not the multi-MB weight files.
+*.pt
+*.pth
+
+# Log captures
+*.out
+
+# Tooling scratch / caches
+graphify-out/
+
+# Papers / large reference docs (not source)
+TITAN.pdf

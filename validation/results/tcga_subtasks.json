@@ -1,0 +1,148 @@
+{
+  "NSCLC_LUAD_vs_LUSC": {
+    "classes": [
+      "LUAD",
+      "LUSC"
+    ],
+    "n": {
+      "train": 669,
+      "val": 96,
+      "test": 278
+    },
+    "test_class_counts": {
+      "LUSC": 100,
+      "LUAD": 178
+    },
+    "linear_probe": {
+      "acc": 0.9064748201438849,
+      "bacc": 0.905056179775281,
+      "kappa": 0.7996007541310858,
+      "nw_kappa": 0.7996007541310858,
+      "weighted_f1": 0.9070351929274888,
+      "loss": -1.0,
+      "auroc": -1.0
+    },
+    "retrieval": {
+      "acc@1": 0.8992805755395683,
+      "mvacc@3": 0.9064748201438849
+    }
+  },
+  "RCC_3way": {
+    "classes": [
+      "CCRCC",
+      "CHRCC",
+      "PRCC"
+    ],
+    "n": {
+      "train": 717,
+      "val": 114,
+      "test": 94
+    },
+    "test_class_counts": {
+      "CHRCC": 25,
+      "CCRCC": 15,
+      "PRCC": 54
+    },
+    "linear_probe": {
+      "acc": 0.9042553191489362,
+      "bacc": 0.8570370370370369,
+      "kappa": 0.7114794352363413,
+      "nw_kappa": 0.7725347852389595,
+      "weighted_f1": 0.9029461455101067,
+      "loss": 0.4410915622597042,
+      "auroc": 0.934
+    },
+    "retrieval": {
+      "acc@1": 0.8829787234042553,
+      "mvacc@3": 0.9148936170212766
+    }
+  },
+  "BRCA_IDC_vs_ILC": {
+    "classes": [
+      "IDC",
+      "ILC"
+    ],
+    "n": {
+      "train": 897,
+      "val": 85,
+      "test": 67
+    },
+    "test_class_counts": {
+      "ILC": 21,
+      "IDC": 46
+    },
+    "linear_probe": {
+      "acc": 0.9402985074626866,
+      "bacc": 0.9047619047619048,
+      "kappa": 0.8537117903930131,
+      "nw_kappa": 0.8537117903930131,
+      "weighted_f1": 0.9384001047394607,
+      "loss": -1.0,
+      "auroc": -1.0
+    },
+    "retrieval": {
+      "acc@1": 0.9253731343283582,
+      "mvacc@3": 0.9402985074626866
+    }
+  },
+  "Sarcoma_4way": {
+    "classes": [
+      "DDLS",
+      "LMS",
+      "MFH",
+      "MFS"
+    ],
+    "n": {
+      "train": 374,
+      "val": 147,
+      "test": 27
+    },
+    "test_class_counts": {
+      "DDLS": 2,
+      "MFS": 9,
+      "MFH": 6,
+      "LMS": 10
+    },
+    "linear_probe": {
+      "acc": 0.5185185185185185,
+      "bacc": 0.5333333333333333,
+      "kappa": 0.4479065238558909,
+      "nw_kappa": 0.41219158200290273,
+      "weighted_f1": 0.47961092405536854,
+      "loss": 1.111960322545868,
+      "auroc": 0.8169753086419753
+    },
+    "retrieval": {
+      "acc@1": 0.4074074074074074,
+      "mvacc@3": 0.37037037037037035
+    }
+  },
+  "Brain_GBM_vs_LGG": {
+    "classes": [
+      "GBM",
+      "LGG"
+    ],
+    "n": {
+      "train": 1404,
+      "val": 254,
+      "test": 43
+    },
+    "test_class_counts": {
+      "LGG": 33,
+      "GBM": 10
+    },
+    "linear_probe": {
+      "acc": 0.8372093023255814,
+      "bacc": 0.8242424242424242,
+      "kappa": 0.5871056241426611,
+      "nw_kappa": 0.5871056241426611,
+      "weighted_f1": 0.8439501179642737,
+      "loss": -1.0,
+      "auroc": -1.0
+    },
+    "retrieval": {
+      "acc@1": 0.8604651162790697,
+      "mvacc@3": 0.8604651162790697
+    }
+  }
+}
