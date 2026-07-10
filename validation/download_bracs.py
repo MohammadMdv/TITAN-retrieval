@@ -1,9 +1,12 @@
 """Download a patient-disjoint, budget-constrained subset of the BRACS WSI set.
 
 BRACS: 547 breast-carcinoma .svs WSIs from ~187 patients, 7 lesion classes
-(N, PB, UDH, FEA, ADH, DCIS, IC), CC0. Registration at https://www.bracs.icar.cnr.it/
-grants FTP credentials; there is no public mirror and the portal does not publish sizes,
-so this script MEASURES every candidate file over FTP before committing to a download.
+(N, PB, UDH, FEA, ADH, DCIS, IC), CC0. There is no public mirror and the portal does not
+publish file sizes, so this script MEASURES every candidate over FTP before downloading.
+
+Access: the BRACS FTP server is ANONYMOUS-ONLY. Registration on the website gates the portal
+page that tells you the FTP host, not the FTP server itself -- so only BRACS_FTP_HOST is
+required. (Supplying BRACS_FTP_USER/PASS is harmless: they are tried first, then anonymous.)
 
 Why subset by PATIENT and never by slide
 ----------------------------------------
@@ -22,8 +25,7 @@ is not stated anywhere. This script CHECKS it against the metadata and reports t
 
 Usage
 -----
-    # 1. register, then put credentials in .env (see .env.example):
-    #      BRACS_FTP_HOST=... BRACS_FTP_USER=... BRACS_FTP_PASS=...
+    # 1. put the FTP host in .env (see .env.example):  BRACS_FTP_HOST=...
     # 2. inspect the plan without downloading anything (fast, recommended first):
     python validation/download_bracs.py --dry-run
     # 3. run the real download (long; resumable -- safe to Ctrl-C and re-run):
@@ -61,74 +63,178 @@ CLASSES = ["N", "PB", "UDH", "FEA", "ADH", "DCIS", "IC"]
 # --------------------------------------------------------------------------- FTP
 
 
+class ReusedSslFTP_TLS(ftplib.FTP_TLS):
+    """FTP_TLS that reuses the control channel's TLS session on the data channel.
+
+    vsFTPd with `require_ssl_reuse=YES` (the BRACS server's setting) rejects data transfers
+    that negotiate a fresh TLS session: "522 SSL connection failed: session reuse required".
+    Stdlib FTP_TLS does not reuse, so plain FTPS logs in fine and then dies on the first LIST.
+    """
+
+    def ntransfercmd(self, cmd, rest=None):
+        conn, size = ftplib.FTP.ntransfercmd(self, cmd, rest)
+        if self._prot_p:
+            conn = self.context.wrap_socket(conn, server_hostname=self.host,
+                                            session=self.sock.session)
+        return conn, size
+
+
+def _try_login(host, user, pw, use_tls):
+    """One connect+login attempt, VALIDATED by an actual data-channel round-trip.
+
+    Logging in successfully is not enough: TLS data-channel problems only surface on the first
+    transfer. So we issue a NLST here and let a failure fall through to the next candidate.
+    """
+    ftp = ReusedSslFTP_TLS(host, timeout=60) if use_tls else ftplib.FTP(host, timeout=60)
+    try:
+        ftp.login(user, pw)
+        if use_tls:
+            ftp.prot_p()
+        ftp.set_pasv(True)
+        ftp.voidcmd("TYPE I")  # binary mode; SIZE is only valid here
+        ftp.nlst()             # prove the data channel actually works
+        return ftp
+    except Exception:
+        try:
+            ftp.close()
+        except Exception:
+            pass
+        raise
+
+
 def connect():
+    """Log in to the BRACS FTP server.
+
+    The BRACS server is ANONYMOUS-ONLY ("530 This FTP server is anonymous only"): registration
+    gates the web portal, not FTP. So credentials are optional -- if BRACS_FTP_USER/PASS are
+    set we try them first (in case the server ever changes), then fall back to anonymous.
+    """
     host = os.environ.get("BRACS_FTP_HOST")
+    if not host:
+        sys.exit("[bracs] Missing BRACS_FTP_HOST. Set it in your .env (see .env.example).\n"
+                 "        The BRACS FTP server allows anonymous access; no username needed.")
+
     user = os.environ.get("BRACS_FTP_USER")
     pw = os.environ.get("BRACS_FTP_PASS")
-    if not (host and user and pw):
-        sys.exit("[bracs] Missing BRACS_FTP_HOST / BRACS_FTP_USER / BRACS_FTP_PASS.\n"
-                 "        Register at https://www.bracs.icar.cnr.it/ to obtain FTP credentials,\n"
-                 "        then add them to your .env (see .env.example).")
-    try:  # prefer TLS when the server offers it; fall back to plain FTP
-        ftp = ftplib.FTP_TLS(host, timeout=60)
-        ftp.login(user, pw)
-        ftp.prot_p()
-        print(f"[bracs] connected to {host} over FTPS")
-    except (ftplib.error_perm, ssl.SSLError, OSError):
-        ftp = ftplib.FTP(host, timeout=60)
-        ftp.login(user, pw)
-        print(f"[bracs] connected to {host} over plain FTP")
-    ftp.set_pasv(True)
-    ftp.voidcmd("TYPE I")  # binary mode; SIZE is only valid here
-    return ftp
+    attempts = []
+    if user and pw:
+        attempts.append((user, pw, "supplied credentials"))
+    attempts.append(("anonymous", "anonymous@", "anonymous"))
+
+    last = None
+    for u, p, how in attempts:
+        for use_tls in (True, False):
+            try:
+                ftp = _try_login(host, u, p, use_tls)
+                print(f"[bracs] connected to {host} over "
+                      f"{'FTPS' if use_tls else 'plain FTP'} ({how})")
+                return ftp
+            except (ftplib.error_perm, ftplib.error_temp, ftplib.error_proto,
+                    ssl.SSLError, EOFError, OSError) as e:
+                last = e
+                if isinstance(e, ftplib.error_perm) and "anonymous only" in str(e).lower():
+                    break  # credentials will never work here; skip straight to anonymous
+    sys.exit(f"[bracs] could not log in to {host}: {last}")
 
 
-def walk(ftp, path, depth=0):
-    """Yield (remote_path, size_bytes) for every file under `path`.
+def _parse_list_line(line):
+    """Parse one Unix `ls -l` style LIST line -> (name, size_or_None). None size => directory.
 
-    Uses MLSD where supported (gives type+size directly); otherwise falls back to NLST and
-    probes each entry with SIZE (a directory makes SIZE fail, which is how we tell them apart).
+    vsFTPd emits: `-rw-r--r--  1 0 0  1684552007 Jan 01 12:00 BRACS_300.svs`
+    Names may contain spaces, so split at most 8 times and keep the remainder as the name.
+    """
+    parts = line.split(maxsplit=8)
+    if len(parts) < 9:
+        return None, None
+    name = parts[8]
+    if name in (".", ".."):
+        return None, None
+    if line[0] == "d":
+        return name, None
+    if line[0] == "l":  # symlink: "name -> target"
+        name = name.split(" -> ")[0]
+        return name, None
+    try:
+        return name, int(parts[4])
+    except ValueError:
+        return None, None
+
+
+def listdir(ftp, path=""):
+    """Return [(full_path, size_or_None)] for one directory. size None => it is a directory.
+
+    The BRACS server is vsFTPd without MLSD ("500 Unknown command"). Rather than NLST plus a
+    SIZE probe per entry (one round-trip each -- ~1.6 files/s over this link), we issue one
+    LIST per directory, which already carries type and size for every entry. NLST+SIZE stays
+    as a last-resort fallback for servers with unparseable LIST output.
     """
     try:
-        entries = list(ftp.mlsd(path))
-    except (ftplib.error_perm, ftplib.error_proto):
-        entries = None
-
-    if entries is not None:
-        for name, facts in entries:
+        out = []
+        for name, facts in ftp.mlsd(path or "."):
             if name in (".", ".."):
                 continue
-            child = f"{path}/{name}"
+            full = f"{path.rstrip('/')}/{name}" if path else name
             if facts.get("type") == "dir":
-                yield from walk(ftp, child, depth + 1)
+                out.append((full, None))
             elif facts.get("type") == "file":
-                size = int(facts["size"]) if "size" in facts else (ftp.size(child) or 0)
-                yield child, size
-        return
+                out.append((full, int(facts["size"]) if "size" in facts else ftp.size(full)))
+        return out
+    except (ftplib.error_perm, ftplib.error_proto, ftplib.error_temp):
+        pass  # no MLSD -> LIST
 
-    for child in ftp.nlst(path):
-        if child.rstrip("/").split("/")[-1] in (".", ".."):
+    lines = []
+    try:
+        ftp.retrlines(f"LIST {path}" if path else "LIST", lines.append)
+        out = []
+        for line in lines:
+            name, size = _parse_list_line(line)
+            if name is None:
+                continue
+            out.append((f"{path.rstrip('/')}/{name}" if path else name, size))
+        if out or not lines:
+            return out
+    except (ftplib.error_perm, ftplib.error_proto, ftplib.error_temp):
+        pass  # unparseable LIST -> NLST + SIZE probe
+
+    out = []
+    for full in ftp.nlst(path):
+        if full.rstrip("/").split("/")[-1] in (".", ".."):
             continue
         try:
-            size = ftp.size(child)
-        except ftplib.error_perm:
+            size = ftp.size(full)
+        except (ftplib.error_perm, ftplib.error_temp):
             size = None
+        out.append((full, size))
+    return out
+
+
+def walk(ftp, path):
+    """Yield (remote_path, size_bytes) for every file beneath `path`."""
+    for full, size in listdir(ftp, path):
         if size is None:
-            yield from walk(ftp, child, depth + 1)
+            yield from walk(ftp, full)
         else:
-            yield child, size
+            yield full, size
 
 
 def find_root(ftp):
-    """Locate the Whole Slide Image Set directory (name/casing varies)."""
-    for base in ("", "/"):
-        try:
-            for name, facts in ftp.mlsd(base or "."):
-                if facts.get("type") == "dir" and any(h in name.lower() for h in WSI_DIR_HINTS):
-                    return f"{base.rstrip('/')}/{name}"
-        except Exception:
-            continue
-    return None
+    """Locate the WSI directory at the server root (BRACS_WSI).
+
+    Must not match BRACS_WSI_Annotations (contains 'wsi') or BRACS_RoI.
+    """
+    if os.environ.get("BRACS_WSI_DIR"):
+        return os.environ["BRACS_WSI_DIR"]
+    cands = [p for p, size in listdir(ftp, "")
+             if size is None
+             and any(h in p.lower() for h in WSI_DIR_HINTS)
+             and "annot" not in p.lower() and "roi" not in p.lower()]
+    return min(cands, key=len) if cands else None
+
+
+def find_metadata(ftp):
+    """The BRACS.xlsx summary lives at the SERVER ROOT, not inside BRACS_WSI."""
+    return [p for p, size in listdir(ftp, "")
+            if size is not None and p.lower().endswith((".xlsx", ".xls"))]
 
 
 # --------------------------------------------------------------- metadata parsing
@@ -182,9 +288,34 @@ def check_patient_disjoint(meta):
             if shared:
                 overlaps[f"{a}&{b}"] = sorted(shared)
     if overlaps:
-        detail = "; ".join(f"{k}: {len(v)} patients" for k, v in overlaps.items())
+        detail = "; ".join(f"{k}: {sorted(v)}" for k, v in overlaps.items())
         return False, detail
     return True, "train/val/test patient sets are pairwise disjoint"
+
+
+def repair_splits(meta):
+    """Make the official split patient-disjoint by assigning each straddling patient wholly
+    to one split: the one where it already holds the most slides (ties -> the larger split).
+
+    As of the current BRACS release exactly one patient straddles (id 67: 3 training slides,
+    2 validation) and `testing` is already disjoint from both -- so the leak only ever
+    contaminated hyperparameter selection, never test evaluation. Repairing costs a couple of
+    validation slides and buys a split that is safe to select on. Returns (meta, moves).
+    """
+    meta = meta.copy()
+    order = ["training", "testing", "validation"]  # tie-break preference: bigger split wins
+    rank = {s: i for i, s in enumerate(order)}
+    moves = []
+    for pid, g in meta.groupby("patient_id"):
+        splits = set(g["official_split"])
+        if len(splits) <= 1:
+            continue
+        counts = g["official_split"].value_counts()
+        keep = sorted(counts.index, key=lambda s: (-counts[s], rank.get(s, 99)))[0]
+        for s in splits - {keep}:
+            moves.append((pid, s, keep, int(counts[s])))
+        meta.loc[meta["patient_id"] == pid, "official_split"] = keep
+    return meta, moves
 
 
 # ------------------------------------------------------------------- selection
@@ -272,6 +403,9 @@ def main():
     ap.add_argument("--dry-run", action="store_true",
                     help="measure sizes, print the selection plan, download nothing")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
+    ap.add_argument("--no-repair-splits", action="store_true",
+                    help="do not reassign patients that straddle the official splits; "
+                         "pool them instead and build your own splits later")
     args = ap.parse_args()
 
     load_env_file()
@@ -291,12 +425,12 @@ def main():
     print("[bracs] indexing remote files (measuring sizes, no download yet) ...")
     files = list(tqdm(walk(ftp, root), desc="  indexing", unit="file"))
     svs = {Path(p).stem: (p, s) for p, s in files if p.lower().endswith(".svs")}
-    xlsx = [p for p, _ in files if p.lower().endswith((".xlsx", ".xls"))]
+    xlsx = find_metadata(ftp)  # BRACS.xlsx sits at the server root, not under BRACS_WSI
     print(f"[bracs] found {len(svs)} .svs ({sum(s for _, s in svs.values())/GB:.1f} GB total) "
-          f"and {len(xlsx)} metadata file(s)")
+          f"and {len(xlsx)} metadata file(s) at the server root")
 
     if not xlsx:
-        sys.exit("[bracs] no .xlsx metadata found under the WSI root; cannot map slides to "
+        sys.exit("[bracs] no .xlsx metadata found at the server root; cannot map slides to "
                  "patients, and a patient-disjoint subset is impossible without it.")
 
     meta_local = BRACS_ROOT / Path(xlsx[0]).name
@@ -314,10 +448,19 @@ def main():
 
     disjoint, report = check_patient_disjoint(meta)
     print(f"\n[bracs] official split patient-disjoint? {'YES' if disjoint else 'NO'} -- {report}")
-    if not disjoint:
-        print("[bracs] WARNING: the official split shares patients across sets. It is NOT safe\n"
-              "        for patient-disjoint evaluation. Selecting patients from the pooled set;\n"
-              "        build your own grouped splits before training.")
+    if not disjoint and not args.no_repair_splits:
+        meta, moves = repair_splits(meta)
+        print("[bracs] repairing: each straddling patient is reassigned wholly to one split")
+        for pid, frm, to, n in moves:
+            print(f"[bracs]   patient {pid}: {n} slide(s) moved {frm} -> {to}")
+        disjoint, report = check_patient_disjoint(meta)
+        print(f"[bracs] after repair, patient-disjoint? {'YES' if disjoint else 'NO'} -- {report}")
+        if not disjoint:
+            sys.exit("[bracs] repair failed; refusing to proceed with a leaking split.")
+    elif not disjoint:
+        print("[bracs] WARNING: the official split shares patients across sets and --no-repair-\n"
+              "        splits was given. It is NOT safe for patient-disjoint evaluation.\n"
+              "        Selecting from the pooled set; build your own grouped splits first.")
 
     # ---- selection
     plan = []
