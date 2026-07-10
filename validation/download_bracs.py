@@ -1,45 +1,55 @@
-"""Download a patient-disjoint, budget-constrained subset of the BRACS WSI set.
+"""Download BRACS (breast carcinoma subtyping, 7 classes, CC0) with patient-disjoint splits.
 
-BRACS: 547 breast-carcinoma .svs WSIs from ~187 patients, 7 lesion classes
-(N, PB, UDH, FEA, ADH, DCIS, IC), CC0. There is no public mirror and the portal does not
-publish file sizes, so this script MEASURES every candidate over FTP before downloading.
+Two image sets are available; `--set roi` is the default and the recommended one.
 
-Access: the BRACS FTP server is ANONYMOUS-ONLY. Registration on the website gates the portal
-page that tells you the FTP host, not the FTP server itself -- so only BRACS_FTP_HOST is
-required. (Supplying BRACS_FTP_USER/PASS is harmless: they are tried first, then anonymous.)
+  roi  4,539 ROIs (.png), 51.8 GB, 387 parent WSIs, 151 patients.
+       Fits entirely on disk, so there is no budget subsetting and therefore no selection
+       bias. Its official train/val/test split IS patient-disjoint (verified), and classes
+       are near-balanced in every split (test: 79-85 ROIs per class). TITAN encodes an ROI
+       as a small slide -- the same way the paper's own TCGA-UT-8K evaluation works.
 
-Why subset by PATIENT and never by slide
-----------------------------------------
-BRACS averages ~2.9 slides per patient. Selecting individual slides would place slides from
-one patient on both sides of a train/test boundary -- precisely the leakage this project
-exists to avoid. Every selection here is all-or-nothing at the patient level.
+  wsi  547 full slides (.svs), 984.1 GB, 189 patients, mean 1.93 GB/slide.
+       Far too large to take whole. A DISK_BUDGET_GB subset is selected at PATIENT
+       granularity (BRACS averages ~2.9 slides/patient; slide-level subsetting would put a
+       patient on both sides of a split). Caveat: the greedy selector prefers cheap patients,
+       so the subset skews toward slides with less tissue, and at 150 GB it yields only ~18
+       test queries -- too few to measure a retrieval effect.
 
-What this script does NOT assume
---------------------------------
-BRACS's official 395:65:87 split is documented as slide-level; whether it is patient-disjoint
-is not stated anywhere. This script CHECKS it against the metadata and reports the answer.
-  - if disjoint  -> the subset preserves the official split assignment (so results stay
-                    comparable to published BRACS numbers), budgeting each split separately.
-  - if NOT       -> it says so loudly, pools all patients, and leaves split construction to a
-                    later step. Do not silently reuse a leaking split.
+Access
+------
+The BRACS FTP server is ANONYMOUS-ONLY. Registering on the website gates the portal page
+that reveals the hostname, not the FTP server, so only BRACS_FTP_HOST is required.
+(BRACS_FTP_USER/PASS are optional; if set they are tried before anonymous.)
+
+The server is vsFTPd: no MLSD, and it demands TLS session reuse on the data channel -- stock
+ftplib.FTP_TLS logs in fine and then fails every transfer with "522 ... session reuse
+required". Both are handled below.
+
+Split integrity
+---------------
+The WSI split shipped with BRACS is NOT patient-disjoint: patient 67 straddles training
+(3 PB slides) and validation (2 N slides); testing is clean. So the leak corrupts
+hyperparameter selection, not test evaluation. `repair_splits()` reassigns any straddling
+patient wholly to its majority split, and the script refuses to proceed if a leak survives.
+The ROI split needs no repair, but is checked all the same rather than trusted.
 
 Usage
 -----
-    # 1. put the FTP host in .env (see .env.example):  BRACS_FTP_HOST=...
-    # 2. inspect the plan without downloading anything (fast, recommended first):
-    python validation/download_bracs.py --dry-run
-    # 3. run the real download (long; resumable -- safe to Ctrl-C and re-run):
-    python validation/download_bracs.py
+    # put the host in .env:  BRACS_FTP_HOST=histoimage.na.icar.cnr.it
+    python validation/download_bracs.py --dry-run          # plan only, downloads nothing
+    python validation/download_bracs.py                    # ROI set (51.8 GB)
+    python validation/download_bracs.py --set wsi          # budgeted WSI subset
 
-Resumable: a slide already on disk with the exact remote byte size is skipped; a partial file
-is resumed with FTP REST. Interrupting and re-running never re-downloads completed slides.
+Resumable: a file already on disk with the exact remote byte size is skipped; a partial file
+resumes via FTP REST. Ctrl-C is safe; re-running never re-fetches completed files.
 
-Env: DISK_BUDGET_GB (default 150), MIN_PER_CLASS (default 5), BRACS_ROOT, SEED.
+Env: BRACS_FTP_HOST, BRACS_ROOT, DISK_BUDGET_GB (default 150), MIN_PER_CLASS (default 5), SEED.
 """
 import argparse
 import ftplib
 import os
 import random
+import re
 import ssl
 import sys
 from collections import defaultdict
@@ -56,8 +66,16 @@ MIN_PER_CLASS = int(os.environ.get("MIN_PER_CLASS", 5))
 SEED = int(os.environ.get("SEED", 0))
 
 GB = 1024 ** 3
-WSI_DIR_HINTS = ("whole slide image", "wsi")
 CLASSES = ["N", "PB", "UDH", "FEA", "ADH", "DCIS", "IC"]
+
+# Remote layout, per set:
+#   wsi: BRACS_WSI/<split>/Group_<G>/Type_<LABEL>/BRACS_<id>.svs
+#   roi: BRACS_RoI/latest_version/<split>/<n>_<LABEL>/BRACS_<wsi>_<LABEL>_<n>.png
+SETS = {
+    "wsi": {"dir": "BRACS_WSI", "ext": ".svs"},
+    "roi": {"dir": "BRACS_RoI/latest_version", "ext": ".png"},
+}
+METADATA_XLSX = "BRACS.xlsx"  # lives at the SERVER ROOT, not inside the image dirs
 
 
 # --------------------------------------------------------------------------- FTP
@@ -66,9 +84,8 @@ CLASSES = ["N", "PB", "UDH", "FEA", "ADH", "DCIS", "IC"]
 class ReusedSslFTP_TLS(ftplib.FTP_TLS):
     """FTP_TLS that reuses the control channel's TLS session on the data channel.
 
-    vsFTPd with `require_ssl_reuse=YES` (the BRACS server's setting) rejects data transfers
-    that negotiate a fresh TLS session: "522 SSL connection failed: session reuse required".
-    Stdlib FTP_TLS does not reuse, so plain FTPS logs in fine and then dies on the first LIST.
+    vsFTPd with `require_ssl_reuse=YES` (this server) rejects data connections that negotiate
+    a fresh TLS session: "522 SSL connection failed: session reuse required".
     """
 
     def ntransfercmd(self, cmd, rest=None):
@@ -80,10 +97,10 @@ class ReusedSslFTP_TLS(ftplib.FTP_TLS):
 
 
 def _try_login(host, user, pw, use_tls):
-    """One connect+login attempt, VALIDATED by an actual data-channel round-trip.
+    """One connect+login attempt, VALIDATED by a real data-channel round-trip.
 
-    Logging in successfully is not enough: TLS data-channel problems only surface on the first
-    transfer. So we issue a NLST here and let a failure fall through to the next candidate.
+    Logging in is not proof of a working connection: TLS data-channel faults only appear on
+    the first transfer. The NLST here forces that failure now, so connect() can fall back.
     """
     ftp = ReusedSslFTP_TLS(host, timeout=60) if use_tls else ftplib.FTP(host, timeout=60)
     try:
@@ -92,7 +109,7 @@ def _try_login(host, user, pw, use_tls):
             ftp.prot_p()
         ftp.set_pasv(True)
         ftp.voidcmd("TYPE I")  # binary mode; SIZE is only valid here
-        ftp.nlst()             # prove the data channel actually works
+        ftp.nlst()
         return ftp
     except Exception:
         try:
@@ -103,23 +120,14 @@ def _try_login(host, user, pw, use_tls):
 
 
 def connect():
-    """Log in to the BRACS FTP server.
-
-    The BRACS server is ANONYMOUS-ONLY ("530 This FTP server is anonymous only"): registration
-    gates the web portal, not FTP. So credentials are optional -- if BRACS_FTP_USER/PASS are
-    set we try them first (in case the server ever changes), then fall back to anonymous.
-    """
     host = os.environ.get("BRACS_FTP_HOST")
     if not host:
-        sys.exit("[bracs] Missing BRACS_FTP_HOST. Set it in your .env (see .env.example).\n"
+        sys.exit("[bracs] Missing BRACS_FTP_HOST. Set it in .env (see .env.example).\n"
                  "        The BRACS FTP server allows anonymous access; no username needed.")
 
-    user = os.environ.get("BRACS_FTP_USER")
-    pw = os.environ.get("BRACS_FTP_PASS")
-    attempts = []
-    if user and pw:
-        attempts.append((user, pw, "supplied credentials"))
-    attempts.append(("anonymous", "anonymous@", "anonymous"))
+    user, pw = os.environ.get("BRACS_FTP_USER"), os.environ.get("BRACS_FTP_PASS")
+    attempts = ([(user, pw, "supplied credentials")] if user and pw else []) + \
+               [("anonymous", "anonymous@", "anonymous")]
 
     last = None
     for u, p, how in attempts:
@@ -133,16 +141,12 @@ def connect():
                     ssl.SSLError, EOFError, OSError) as e:
                 last = e
                 if isinstance(e, ftplib.error_perm) and "anonymous only" in str(e).lower():
-                    break  # credentials will never work here; skip straight to anonymous
+                    break  # credentials can never work here; go straight to anonymous
     sys.exit(f"[bracs] could not log in to {host}: {last}")
 
 
 def _parse_list_line(line):
-    """Parse one Unix `ls -l` style LIST line -> (name, size_or_None). None size => directory.
-
-    vsFTPd emits: `-rw-r--r--  1 0 0  1684552007 Jan 01 12:00 BRACS_300.svs`
-    Names may contain spaces, so split at most 8 times and keep the remainder as the name.
-    """
+    """Parse one `ls -l` style LIST line -> (name, size_or_None). None size => directory."""
     parts = line.split(maxsplit=8)
     if len(parts) < 9:
         return None, None
@@ -152,8 +156,7 @@ def _parse_list_line(line):
     if line[0] == "d":
         return name, None
     if line[0] == "l":  # symlink: "name -> target"
-        name = name.split(" -> ")[0]
-        return name, None
+        return name.split(" -> ")[0], None
     try:
         return name, int(parts[4])
     except ValueError:
@@ -161,12 +164,11 @@ def _parse_list_line(line):
 
 
 def listdir(ftp, path=""):
-    """Return [(full_path, size_or_None)] for one directory. size None => it is a directory.
+    """[(full_path, size_or_None)] for one directory; None size => directory.
 
-    The BRACS server is vsFTPd without MLSD ("500 Unknown command"). Rather than NLST plus a
-    SIZE probe per entry (one round-trip each -- ~1.6 files/s over this link), we issue one
-    LIST per directory, which already carries type and size for every entry. NLST+SIZE stays
-    as a last-resort fallback for servers with unparseable LIST output.
+    This server has no MLSD. NLST+SIZE would cost a round-trip per entry (~1.6 files/s over
+    this link); one LIST per directory already carries type and size for every entry, which
+    takes a full 547-slide index from ~6 min to ~45 s. NLST+SIZE remains a last resort.
     """
     try:
         out = []
@@ -180,7 +182,7 @@ def listdir(ftp, path=""):
                 out.append((full, int(facts["size"]) if "size" in facts else ftp.size(full)))
         return out
     except (ftplib.error_perm, ftplib.error_proto, ftplib.error_temp):
-        pass  # no MLSD -> LIST
+        pass
 
     lines = []
     try:
@@ -188,13 +190,12 @@ def listdir(ftp, path=""):
         out = []
         for line in lines:
             name, size = _parse_list_line(line)
-            if name is None:
-                continue
-            out.append((f"{path.rstrip('/')}/{name}" if path else name, size))
+            if name is not None:
+                out.append((f"{path.rstrip('/')}/{name}" if path else name, size))
         if out or not lines:
             return out
     except (ftplib.error_perm, ftplib.error_proto, ftplib.error_temp):
-        pass  # unparseable LIST -> NLST + SIZE probe
+        pass
 
     out = []
     for full in ftp.nlst(path):
@@ -217,24 +218,11 @@ def walk(ftp, path):
             yield full, size
 
 
-def find_root(ftp):
-    """Locate the WSI directory at the server root (BRACS_WSI).
-
-    Must not match BRACS_WSI_Annotations (contains 'wsi') or BRACS_RoI.
-    """
-    if os.environ.get("BRACS_WSI_DIR"):
-        return os.environ["BRACS_WSI_DIR"]
-    cands = [p for p, size in listdir(ftp, "")
-             if size is None
-             and any(h in p.lower() for h in WSI_DIR_HINTS)
-             and "annot" not in p.lower() and "roi" not in p.lower()]
-    return min(cands, key=len) if cands else None
-
-
-def find_metadata(ftp):
-    """The BRACS.xlsx summary lives at the SERVER ROOT, not inside BRACS_WSI."""
-    return [p for p, size in listdir(ftp, "")
-            if size is not None and p.lower().endswith((".xlsx", ".xls"))]
+def fetch(ftp, remote, local):
+    local.parent.mkdir(parents=True, exist_ok=True)
+    with open(local, "wb") as fh:
+        ftp.retrbinary(f"RETR {remote}", fh.write)
+    return local
 
 
 # --------------------------------------------------------------- metadata parsing
@@ -242,15 +230,14 @@ def find_metadata(ftp):
 
 def _pick_column(cols, *keywords):
     for c in cols:
-        lc = str(c).strip().lower()
-        if any(k in lc for k in keywords):
+        if any(k in str(c).strip().lower() for k in keywords):
             return c
     return None
 
 
 def parse_metadata(xlsx_path):
-    """BRACS ships an .xlsx with, per WSI: label, reference set, patient ID, #ROIs.
-    Column names are not documented, so match them case-insensitively by keyword."""
+    """BRACS.xlsx sheet 'WSI_Information': WSI Filename | Patient Id | RoI | WSI label | Set.
+    Column names are undocumented, so match case-insensitively by keyword."""
     df = pd.read_excel(xlsx_path)
     cols = list(df.columns)
     c_slide = _pick_column(cols, "wsi", "slide", "filename", "image")
@@ -269,42 +256,69 @@ def parse_metadata(xlsx_path):
         "slide_id": df[c_slide].astype(str).str.strip().str.replace(r"\.svs$", "", regex=True),
         "patient_id": df[c_pat].astype(str).str.strip(),
         "label": df[c_lab].astype(str).str.strip(),
-        "official_split": (df[c_set].astype(str).str.strip().str.lower()
-                           if c_set else "unknown"),
+        "official_split": (df[c_set].astype(str).str.strip().str.lower() if c_set else "unknown"),
     })
     return out.dropna(subset=["slide_id", "patient_id"]).drop_duplicates("slide_id")
 
 
+def build_items(which, files, wsi_meta, root):
+    """Turn the remote file listing into one row per downloadable item.
+
+    wsi: identity/label/split all come from the .xlsx (authoritative, and the only place
+         patient IDs exist). Remote paths are matched to it by filename stem.
+    roi: split and label come from the ROI directory tree (the ROI split is its OWN split and
+         differs from the WSI split); the patient comes from the parent WSI via the .xlsx.
+    """
+    wsi2pat = dict(zip(wsi_meta.slide_id, wsi_meta.patient_id))
+
+    if which == "wsi":
+        remote = {Path(p).stem: (p, s) for p, s in files}
+        m = wsi_meta[wsi_meta.slide_id.isin(remote)].copy()
+        m["item_id"] = m.slide_id
+        m["remote"] = m.slide_id.map(lambda s: remote[s][0])
+        m["bytes"] = m.slide_id.map(lambda s: remote[s][1])
+        return m[["item_id", "patient_id", "label", "official_split", "remote", "bytes"]]
+
+    rows = []
+    for p, size in files:
+        rel = p[len(root):].strip("/").split("/")   # <split>/<n>_<LABEL>/<file>.png
+        if len(rel) < 3:
+            continue
+        split, class_dir, fname = rel[0], rel[1], rel[-1]
+        match = re.match(r"(BRACS_\d+)", fname)
+        if not match:
+            continue
+        parent = match.group(1)
+        rows.append({"item_id": Path(fname).stem, "patient_id": wsi2pat.get(parent),
+                     "label": class_dir.split("_", 1)[-1], "official_split": split,
+                     "remote": p, "bytes": size, "parent_wsi": parent})
+    df = pd.DataFrame(rows)
+    unmapped = int(df.patient_id.isna().sum())
+    if unmapped:
+        sys.exit(f"[bracs] {unmapped} ROIs have no parent WSI in the metadata; cannot "
+                 f"guarantee patient-disjoint splits. Refusing to continue.")
+    return df
+
+
 def check_patient_disjoint(meta):
-    """Is the official split patient-disjoint? Returns (bool, overlap_report)."""
+    """Is the split patient-disjoint? Returns (bool, report)."""
     if (meta["official_split"] == "unknown").all():
         return False, "no split column found in metadata"
     groups = {s: set(g["patient_id"]) for s, g in meta.groupby("official_split")}
-    overlaps = {}
     names = sorted(groups)
-    for i, a in enumerate(names):
-        for b in names[i + 1:]:
-            shared = groups[a] & groups[b]
-            if shared:
-                overlaps[f"{a}&{b}"] = sorted(shared)
+    overlaps = {f"{a}&{b}": sorted(groups[a] & groups[b])
+                for i, a in enumerate(names) for b in names[i + 1:] if groups[a] & groups[b]}
     if overlaps:
-        detail = "; ".join(f"{k}: {sorted(v)}" for k, v in overlaps.items())
-        return False, detail
+        return False, "; ".join(f"{k}: {v}" for k, v in overlaps.items())
     return True, "train/val/test patient sets are pairwise disjoint"
 
 
 def repair_splits(meta):
-    """Make the official split patient-disjoint by assigning each straddling patient wholly
-    to one split: the one where it already holds the most slides (ties -> the larger split).
-
-    As of the current BRACS release exactly one patient straddles (id 67: 3 training slides,
-    2 validation) and `testing` is already disjoint from both -- so the leak only ever
-    contaminated hyperparameter selection, never test evaluation. Repairing costs a couple of
-    validation slides and buys a split that is safe to select on. Returns (meta, moves).
-    """
+    """Assign each straddling patient wholly to the split where it holds the most items
+    (ties -> the larger split). Returns (meta, moves)."""
     meta = meta.copy()
-    order = ["training", "testing", "validation"]  # tie-break preference: bigger split wins
-    rank = {s: i for i, s in enumerate(order)}
+    rank = {s: i for i, s in enumerate(["training", "train", "testing", "test",
+                                        "validation", "val"])}
     moves = []
     for pid, g in meta.groupby("patient_id"):
         splits = set(g["official_split"])
@@ -312,8 +326,7 @@ def repair_splits(meta):
             continue
         counts = g["official_split"].value_counts()
         keep = sorted(counts.index, key=lambda s: (-counts[s], rank.get(s, 99)))[0]
-        for s in splits - {keep}:
-            moves.append((pid, s, keep, int(counts[s])))
+        moves += [(pid, s, keep, int(counts[s])) for s in splits - {keep}]
         meta.loc[meta["patient_id"] == pid, "official_split"] = keep
     return meta, moves
 
@@ -321,35 +334,27 @@ def repair_splits(meta):
 # ------------------------------------------------------------------- selection
 
 
-def select_patients(meta, sizes, budget_bytes, min_per_class, rng):
-    """Greedy, all-or-nothing per patient.
+def select_patients(meta, budget_bytes, min_per_class, rng):
+    """Greedy, all-or-nothing per patient, under a byte budget.
 
-    Pass 1 guarantees class coverage (rarest class first, cheapest qualifying patient first)
-    so tiny classes like FEA/ADH are not starved by the budget.
-    Pass 2 spends what is left on the patients giving the most slides per byte.
+    Pass 1 secures class coverage (rarest class first, cheapest qualifying patient first) so
+    small classes are not starved. Pass 2 spends the remainder on the best items-per-byte.
     """
     by_pat = defaultdict(list)
     for r in meta.itertuples():
-        if r.slide_id in sizes:
-            by_pat[r.patient_id].append(r)
-    if not by_pat:
-        return [], 0
+        by_pat[r.patient_id].append(r)
 
-    cost = {p: sum(sizes[r.slide_id] for r in rows) for p, rows in by_pat.items()}
+    cost = {p: sum(r.bytes for r in rows) for p, rows in by_pat.items()}
     labels_of = {p: [r.label for r in rows] for p, rows in by_pat.items()}
-
-    chosen, spent = set(), 0
-    class_counts = defaultdict(int)
-
     global_counts = defaultdict(int)
     for rows in by_pat.values():
         for r in rows:
             global_counts[r.label] += 1
 
-    for cls in sorted(global_counts, key=lambda c: global_counts[c]):  # rarest first
-        cands = [p for p in by_pat if p not in chosen and cls in labels_of[p]]
-        cands.sort(key=lambda p: cost[p])                              # cheapest first
-        for p in cands:
+    chosen, spent, class_counts = set(), 0, defaultdict(int)
+    for cls in sorted(global_counts, key=lambda c: global_counts[c]):     # rarest first
+        for p in sorted((p for p in by_pat if p not in chosen and cls in labels_of[p]),
+                        key=lambda p: cost[p]):                            # cheapest first
             if class_counts[cls] >= min_per_class:
                 break
             if spent + cost[p] > budget_bytes:
@@ -360,13 +365,12 @@ def select_patients(meta, sizes, budget_bytes, min_per_class, rng):
                 class_counts[lab] += 1
 
     remaining = [p for p in by_pat if p not in chosen]
-    rng.shuffle(remaining)  # break ties among equal density deterministically
+    rng.shuffle(remaining)  # deterministic tie-break among equal densities
     remaining.sort(key=lambda p: len(by_pat[p]) / max(cost[p], 1), reverse=True)
     for p in remaining:
         if spent + cost[p] <= budget_bytes:
             chosen.add(p)
             spent += cost[p]
-
     return sorted(chosen), spent
 
 
@@ -383,10 +387,9 @@ def download_file(ftp, remote, local, size, overall):
         local.unlink()
         have = 0
 
-    mode = "ab" if have else "wb"
-    with open(local, mode) as fh, tqdm(
+    with open(local, "ab" if have else "wb") as fh, tqdm(
             total=size, initial=have, unit="B", unit_scale=True, unit_divisor=1024,
-            desc=f"  {local.name[:28]:<28}", leave=False) as bar:
+            desc=f"  {local.name[:30]:<30}", leave=False) as bar:
         def cb(chunk):
             fh.write(chunk)
             bar.update(len(chunk))
@@ -400,51 +403,43 @@ def download_file(ftp, remote, local, size, overall):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--set", choices=sorted(SETS), default="roi", dest="which",
+                    help="roi (4,539 ROIs, 51.8 GB, fits whole) or wsi (984 GB, budgeted subset)")
     ap.add_argument("--dry-run", action="store_true",
-                    help="measure sizes, print the selection plan, download nothing")
+                    help="measure sizes, print the plan, download nothing")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     ap.add_argument("--no-repair-splits", action="store_true",
-                    help="do not reassign patients that straddle the official splits; "
-                         "pool them instead and build your own splits later")
+                    help="do not reassign patients that straddle splits; pool them instead")
     args = ap.parse_args()
 
     load_env_file()
     rng = random.Random(SEED)
     budget = int(DISK_BUDGET_GB * GB)
+    dest = BRACS_ROOT / args.which
     BRACS_ROOT.mkdir(parents=True, exist_ok=True)
 
     ftp = connect()
+    root = os.environ.get("BRACS_DIR", SETS[args.which]["dir"])
+    ext = SETS[args.which]["ext"]
+    print(f"[bracs] set={args.which}  remote root={root}")
 
-    root = find_root(ftp)
-    if not root:
-        sys.exit("[bracs] could not locate the 'Whole Slide Image Set' directory on the server.\n"
-                 "        Log in manually and pass the correct path via BRACS_WSI_DIR.")
-    root = os.environ.get("BRACS_WSI_DIR", root)
-    print(f"[bracs] WSI root: {root}")
-
-    print("[bracs] indexing remote files (measuring sizes, no download yet) ...")
-    files = list(tqdm(walk(ftp, root), desc="  indexing", unit="file"))
-    svs = {Path(p).stem: (p, s) for p, s in files if p.lower().endswith(".svs")}
-    xlsx = find_metadata(ftp)  # BRACS.xlsx sits at the server root, not under BRACS_WSI
-    print(f"[bracs] found {len(svs)} .svs ({sum(s for _, s in svs.values())/GB:.1f} GB total) "
-          f"and {len(xlsx)} metadata file(s) at the server root")
-
-    if not xlsx:
-        sys.exit("[bracs] no .xlsx metadata found at the server root; cannot map slides to "
-                 "patients, and a patient-disjoint subset is impossible without it.")
-
-    meta_local = BRACS_ROOT / Path(xlsx[0]).name
+    # metadata first: without patient IDs a patient-disjoint split is impossible
+    meta_local = BRACS_ROOT / METADATA_XLSX
     if not meta_local.exists():
-        with open(meta_local, "wb") as fh:
-            ftp.retrbinary(f"RETR {xlsx[0]}", fh.write)
-    print(f"[bracs] metadata: {meta_local}")
+        print(f"[bracs] fetching {METADATA_XLSX} from the server root ...")
+        fetch(ftp, METADATA_XLSX, meta_local)
+    wsi_meta = parse_metadata(meta_local)
 
-    meta = parse_metadata(meta_local)
-    meta = meta[meta["slide_id"].isin(svs)]
-    sizes = {sid: svs[sid][1] for sid in meta["slide_id"]}
-    print(f"[bracs] {len(meta)} slides matched to metadata across "
-          f"{meta['patient_id'].nunique()} patients")
-    print(f"[bracs] class distribution: {dict(meta['label'].value_counts())}")
+    print("[bracs] indexing remote files (one LIST per directory; no download yet) ...")
+    files = [(p, s) for p, s in tqdm(walk(ftp, root), desc="  indexing", unit="file")
+             if p.lower().endswith(ext)]
+    total_remote = sum(s for _, s in files)
+    print(f"[bracs] {len(files)} {ext} files, {total_remote/GB:.1f} GB on the server")
+
+    meta = build_items(args.which, files, wsi_meta, root)
+    print(f"[bracs] {len(meta)} items / {meta.patient_id.nunique()} patients")
+    print(f"[bracs] classes: {dict(meta.label.value_counts())}")
+    print(f"[bracs] splits:  {dict(meta.official_split.value_counts())}")
 
     disjoint, report = check_patient_disjoint(meta)
     print(f"\n[bracs] official split patient-disjoint? {'YES' if disjoint else 'NO'} -- {report}")
@@ -452,54 +447,54 @@ def main():
         meta, moves = repair_splits(meta)
         print("[bracs] repairing: each straddling patient is reassigned wholly to one split")
         for pid, frm, to, n in moves:
-            print(f"[bracs]   patient {pid}: {n} slide(s) moved {frm} -> {to}")
+            print(f"[bracs]   patient {pid}: {n} item(s) moved {frm} -> {to}")
         disjoint, report = check_patient_disjoint(meta)
         print(f"[bracs] after repair, patient-disjoint? {'YES' if disjoint else 'NO'} -- {report}")
         if not disjoint:
             sys.exit("[bracs] repair failed; refusing to proceed with a leaking split.")
     elif not disjoint:
-        print("[bracs] WARNING: the official split shares patients across sets and --no-repair-\n"
-              "        splits was given. It is NOT safe for patient-disjoint evaluation.\n"
-              "        Selecting from the pooled set; build your own grouped splits first.")
+        print("[bracs] WARNING: splits share patients and --no-repair-splits was given.\n"
+              "        NOT safe for patient-disjoint evaluation; build your own splits.")
 
-    # ---- selection
-    plan = []
-    if disjoint:
-        totals = meta.groupby("official_split").size()
+    # ---- selection: take everything if it fits, else budget per split at patient granularity
+    need = int(meta.bytes.sum())
+    if need <= budget:
+        sel = meta.copy()
+        print(f"\n[bracs] full set is {need/GB:.1f} GB <= budget {DISK_BUDGET_GB:.0f} GB "
+              f"-> taking ALL items (no subsetting, so no selection bias)")
+    else:
+        print(f"\n[bracs] full set is {need/GB:.1f} GB > budget {DISK_BUDGET_GB:.0f} GB "
+              f"-> selecting whole patients per split")
+        print("[bracs] NOTE: the greedy selector prefers cheap patients, so the subset skews "
+              "toward items with less tissue. Treat it as biased.")
+        parts, totals = [], meta.groupby("official_split").size()
         for split, sub in meta.groupby("official_split"):
             share = totals[split] / totals.sum()
-            pats, spent = select_patients(sub, sizes, int(budget * share), MIN_PER_CLASS, rng)
-            sel = sub[sub["patient_id"].isin(pats)].assign(split=split)
-            plan.append(sel)
-            print(f"[bracs]   {split:<6s}: {len(pats):>3d} patients  {len(sel):>3d} slides  "
+            pats, spent = select_patients(sub, int(budget * share), MIN_PER_CLASS, rng)
+            got = sub[sub.patient_id.isin(pats)]
+            parts.append(got)
+            print(f"[bracs]   {split:<11s}: {len(pats):>3d} patients  {len(got):>4d} items  "
                   f"{spent/GB:6.1f} GB (budget {budget*share/GB:.1f} GB)")
-    else:
-        pats, spent = select_patients(meta, sizes, budget, MIN_PER_CLASS, rng)
-        plan.append(meta[meta["patient_id"].isin(pats)].assign(split="unassigned"))
-        print(f"[bracs]   pooled: {len(pats)} patients  {len(plan[0])} slides  {spent/GB:.1f} GB")
+        sel = pd.concat(parts, ignore_index=True)
 
-    sel = pd.concat(plan, ignore_index=True)
-    sel["bytes"] = sel["slide_id"].map(sizes)
-    sel["remote"] = sel["slide_id"].map(lambda s: svs[s][0])
-    total = int(sel["bytes"].sum())
+    # assert, don't assume, that what we are about to download is patient-disjoint
+    gs = {s: set(g.patient_id) for s, g in sel.groupby("official_split")}
+    for a in gs:
+        for b in gs:
+            if a < b and not gs[a].isdisjoint(gs[b]):
+                sys.exit(f"[bracs] selected subset leaks patients between {a} and {b}")
 
-    # patient-disjointness of what we are about to download, asserted not assumed
-    if disjoint:
-        gs = {s: set(g["patient_id"]) for s, g in sel.groupby("split")}
-        for a in gs:
-            for b in gs:
-                if a < b:
-                    assert gs[a].isdisjoint(gs[b]), f"selected subset leaks patients {a}/{b}"
+    total = int(sel.bytes.sum())
+    print(f"\n[bracs] SELECTED {len(sel)} items / {sel.patient_id.nunique()} patients "
+          f"= {total/GB:.1f} GB")
+    pivot = sel.pivot_table(index="label", columns="official_split", aggfunc="size", fill_value=0)
+    print(f"[bracs] class x split:\n{pivot.to_string()}")
+    thin = pivot[pivot.min(axis=1) < MIN_PER_CLASS]
+    if len(thin):
+        print(f"[bracs] NOTE: these classes fall below MIN_PER_CLASS={MIN_PER_CLASS} in some "
+              f"split:\n{thin.to_string()}")
 
-    print(f"\n[bracs] SELECTED {len(sel)} slides / {sel['patient_id'].nunique()} patients "
-          f"= {total/GB:.1f} GB (budget {DISK_BUDGET_GB:.0f} GB)")
-    print(f"[bracs] selected class distribution: {dict(sel['label'].value_counts())}")
-    thin = {c: n for c, n in sel['label'].value_counts().items() if n < MIN_PER_CLASS}
-    if thin:
-        print(f"[bracs] NOTE: classes below MIN_PER_CLASS={MIN_PER_CLASS}: {thin} "
-              f"(the cohort itself may not contain more)")
-
-    manifest = BRACS_ROOT / "manifest.csv"
+    manifest = BRACS_ROOT / f"manifest_{args.which}.csv"
     sel.drop(columns=["remote"]).to_csv(manifest, index=False)
     print(f"[bracs] wrote manifest: {manifest}")
 
@@ -508,32 +503,33 @@ def main():
         ftp.quit()
         return
 
-    free = os.statvfs(BRACS_ROOT).f_bavail * os.statvfs(BRACS_ROOT).f_frsize
+    st = os.statvfs(BRACS_ROOT)
+    free = st.f_bavail * st.f_frsize
     if total > free:
-        sys.exit(f"[bracs] need {total/GB:.1f} GB but only {free/GB:.1f} GB free on disk.")
+        sys.exit(f"[bracs] need {total/GB:.1f} GB but only {free/GB:.1f} GB free.")
     if not args.yes:
-        resp = input(f"\nDownload {len(sel)} slides ({total/GB:.1f} GB) to {BRACS_ROOT}? [y/N] ")
-        if resp.strip().lower() not in ("y", "yes"):
+        if input(f"\nDownload {len(sel)} items ({total/GB:.1f} GB) to {dest}? [y/N] "
+                 ).strip().lower() not in ("y", "yes"):
             print("[bracs] aborted.")
             ftp.quit()
             return
 
-    print(f"\n[bracs] downloading -> {BRACS_ROOT}  (resumable; Ctrl-C is safe)")
+    print(f"\n[bracs] downloading -> {dest}  (resumable; Ctrl-C is safe)")
     counts = defaultdict(int)
     with tqdm(total=total, unit="B", unit_scale=True, unit_divisor=1024,
               desc="overall", position=1) as overall:
         for r in sel.itertuples():
-            local = BRACS_ROOT / "wsi" / r.split / r.label / f"{r.slide_id}.svs"
+            local = dest / r.official_split / r.label / Path(r.remote).name
             for attempt in range(3):
                 try:
                     counts[download_file(ftp, r.remote, local, r.bytes, overall)] += 1
                     break
                 except (ftplib.all_errors, OSError) as e:
                     if attempt == 2:
-                        print(f"\n[bracs] FAILED {r.slide_id}: {e}")
+                        print(f"\n[bracs] FAILED {r.item_id}: {e}")
                         counts["failed"] += 1
                         break
-                    print(f"\n[bracs] retry {r.slide_id} after {type(e).__name__}; reconnecting")
+                    print(f"\n[bracs] retry {r.item_id} after {type(e).__name__}; reconnecting")
                     try:
                         ftp.quit()
                     except Exception:
@@ -541,9 +537,9 @@ def main():
                     ftp = connect()
 
     print(f"\n[bracs] done: {dict(counts)}")
-    print(f"[bracs] slides under {BRACS_ROOT/'wsi'}, manifest at {manifest}")
+    print(f"[bracs] files under {dest}, manifest at {manifest}")
     if counts.get("failed"):
-        print("[bracs] some slides failed -- re-run to retry them (completed ones are skipped).")
+        print("[bracs] some items failed -- re-run to retry (completed ones are skipped).")
     try:
         ftp.quit()
     except Exception:
