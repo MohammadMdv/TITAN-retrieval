@@ -37,6 +37,7 @@ Named `<category>_<dataset>[_<technique>].py`.
 | `subtasks_tcga_ot.py` | Harder patient-disjoint TCGA-OT sub-typing tasks |
 | `common.py`, `retrieval_common.py` | Shared paths/model loading; shared retrieval protocol + metrics |
 | `download_assets.py`, `ut8k_label_recon.py` | Asset download; TCGA-UT-8K label recon |
+| `download_bracs.py` | Patient-disjoint, budget-capped BRACS WSI subset download (FTP, resumable) |
 | `make_results.py` | Aggregates `results/*.json` into `RESULTS.md` |
 
 `run_all.sh` runs the classification, baseline-retrieval, and Tier-1 experiments.

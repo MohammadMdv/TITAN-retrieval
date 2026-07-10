@@ -44,19 +44,33 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def load_env_file(path=None):
+    """Load KEY=VALUE lines from the .env file into os.environ (existing vars win).
+
+    Ignores blank lines, `#` comments, and strips optional surrounding quotes.
+    """
+    path = Path(path) if path else ENV_FILE
+    if not path.exists():
+        return {}
+    loaded = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        key, val = key.strip(), val.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = val
+        loaded[key] = val
+    return loaded
+
+
 def load_hf_token():
-    """Read HF_TOKEN from the histopath-retrieval .env and set it in the environment."""
-    if os.environ.get("HF_TOKEN"):
-        return os.environ["HF_TOKEN"]
-    token = None
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text().splitlines():
-            line = line.strip()
-            if line.startswith("HF_TOKEN="):
-                token = line.split("=", 1)[1].strip()
-                break
+    """Ensure HF_TOKEN is in the environment, reading it from the .env file if needed."""
+    if not os.environ.get("HF_TOKEN"):
+        load_env_file()
+    token = os.environ.get("HF_TOKEN")
     if token:
-        os.environ["HF_TOKEN"] = token
         os.environ["HUGGING_FACE_HUB_TOKEN"] = token
     return token
 

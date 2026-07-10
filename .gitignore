@@ -21,3 +21,6 @@ graphify-out/
 
 # Papers / large reference docs (not source)
 TITAN.pdf
+
+# BRACS raw slides (large, licensed CC0 but not redistributed here)
+data/
