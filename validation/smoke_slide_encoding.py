@@ -1,4 +1,4 @@
-"""Phase 1: load TITAN+CONCHv1.5 and smoke-test the slide-encoding path on ONE local h5.
+"""Smoke test: load TITAN+CONCHv1.5 and exercise the slide-encoding path on ONE local h5.
 
 Verifies:
   - gated HF access works (model downloads/loads)
@@ -14,9 +14,9 @@ from common import load_titan, encode_slide_from_h5, CAM16_H5, get_device, save_
 
 def main():
     device = get_device()
-    print(f"[phase1] device = {device}")
+    print(f"[smoke] device = {device}")
     if device.type != "cuda":
-        print("[phase1] WARNING: CUDA not available; running on CPU (slow).")
+        print("[smoke] WARNING: CUDA not available; running on CPU (slow).")
 
     # inspect one h5 before touching the model
     h5_files = sorted(CAM16_H5.glob("*.h5"))
@@ -26,22 +26,22 @@ def main():
         keys = list(f.keys())
         coord_attrs = dict(f["coords"].attrs) if "coords" in f else {}
         shapes = {k: f[k].shape for k in keys}
-    print(f"[phase1] sample={sample.name} keys={keys} shapes={shapes}")
-    print(f"[phase1] coords attrs = {coord_attrs}")
+    print(f"[smoke] sample={sample.name} keys={keys} shapes={shapes}")
+    print(f"[smoke] coords attrs = {coord_attrs}")
 
-    print("[phase1] loading TITAN (first call downloads gated weights)...")
+    print("[smoke] loading TITAN (first call downloads gated weights)...")
     model, device = load_titan(device)
-    print("[phase1] model loaded. return_conch() sanity...")
+    print("[smoke] model loaded. return_conch() sanity...")
     conch, transform = model.return_conch()
-    print(f"[phase1] CONCHv1.5 loaded: {type(conch).__name__}")
+    print(f"[smoke] CONCHv1.5 loaded: {type(conch).__name__}")
 
     emb, psz, _ = encode_slide_from_h5(model, sample, device)
     finite = bool(torch.isfinite(emb).all())
-    print(f"[phase1] slide_embedding shape={tuple(emb.shape)} dtype={emb.dtype} "
+    print(f"[smoke] slide_embedding shape={tuple(emb.shape)} dtype={emb.dtype} "
           f"patch_size_lv0={psz} finite={finite}")
     assert finite, "slide embedding contains NaN/Inf"
 
-    save_results("phase1_smoke.json", {
+    save_results("smoke_slide_encoding.json", {
         "sample": sample.name,
         "h5_keys": keys,
         "coord_attrs": {k: str(v) for k, v in coord_attrs.items()},
@@ -49,7 +49,7 @@ def main():
         "patch_size_lv0": psz,
         "finite": finite,
     })
-    print("[phase1] OK")
+    print("[smoke] OK")
 
 
 if __name__ == "__main__":

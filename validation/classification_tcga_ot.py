@@ -1,4 +1,4 @@
-"""Phase 3: TCGA-OT (46-class, full WSIs) zero-shot + linear probe.
+"""TCGA-OT classification: 46-class, full WSIs, zero-shot + linear probe.
 
 Runs entirely off the precomputed TCGA_TITAN_features.pkl (TITAN slide embeddings
 for the whole TCGA cohort) + the ./datasets splits. No WSI/patch work.
@@ -63,7 +63,7 @@ def run_zeroshot(model, device, task_config, test_csv, label_dict, target):
     res = get_eval_metrics(targets_all.numpy(), preds_all.numpy(), probs_all.numpy(),
                            roc_kwargs={"multi_class": "ovo", "average": "macro"})
     res = {k.strip("/"): float(v) for k, v in res.items() if isinstance(v, (int, float))}
-    print(f"[phase3] ZS point estimate -> bacc={res.get('bacc'):.4f}  auroc={res.get('auroc')}")
+    print(f"[cls-tcga-ot] ZS point estimate -> bacc={res.get('bacc'):.4f}  auroc={res.get('auroc')}")
     boot_n = int(os.environ.get("BOOTSTRAP_N", "1000"))
     boot = {}
     if boot_n > 0:
@@ -105,17 +105,17 @@ def run_linear_probe(label_dict, target, max_iter=500):
     X_tr, y_tr = split("train")
     X_val, y_val = split("val")
     X_te, y_te = split("test")
-    print(f"[phase3] LP sizes train={len(y_tr)} val={len(y_val)} test={len(y_te)}")
+    print(f"[cls-tcga-ot] LP sizes train={len(y_tr)} val={len(y_val)} test={len(y_te)}")
 
     log_spaced = np.logspace(np.log10(10e-6), np.log10(10e5), num=45)  # paper grid
     n_jobs = int(os.environ.get("N_JOBS", "10"))
-    print(f"[phase3] sweeping 45 C-values across {n_jobs} cores...")
+    print(f"[cls-tcga-ot] sweeping 45 C-values across {n_jobs} cores...")
     fits = Parallel(n_jobs=n_jobs)(
         delayed(_fit_one)(c, X_tr, y_tr, X_val, y_val, max_iter) for c in log_spaced)
     best_i = int(np.argmin([vl for vl, _ in fits]))
     best_C = log_spaced[best_i]
     model = fits[best_i][1]
-    print(f"[phase3] Best C (=1/{best_C:.3g}): 1/{best_C:.6g}")
+    print(f"[cls-tcga-ot] Best C (=1/{best_C:.3g}): 1/{best_C:.6g}")
 
     test_preds = model.predict(X_te)
     test_probs = model.predict_proba(X_te)  # 46 classes -> full matrix
@@ -136,40 +136,40 @@ def main():
     from titan.utils import bootstrap
 
     # --- Linear probe first: pure sklearn on precomputed pkl embeddings, no GPU/model. ---
-    print("[phase3] === LINEAR PROBE (target bacc ~0.704) ===")
+    print("[cls-tcga-ot] === LINEAR PROBE (target bacc ~0.704) ===")
     lp, lp_outputs = run_linear_probe(label_dict, target)
-    print(f"[phase3] LP point estimate -> bacc={lp.get('bacc'):.4f} (ref 0.704)  "
+    print(f"[cls-tcga-ot] LP point estimate -> bacc={lp.get('bacc'):.4f} (ref 0.704)  "
           f"auroc={lp.get('auroc')}  kappa={lp.get('kappa'):.4f}")
     out = {"linear_probe": lp, "reference": {"linear_probe_bacc": 0.704}}
-    save_results("phase3_tcga_ot.json", out)  # save headline BEFORE the slow bootstrap
+    save_results("classification_tcga_ot.json", out)  # save headline BEFORE the slow bootstrap
 
     # bootstrap CIs are a follow-on; N configurable (BOOTSTRAP_N=0 to skip). Doesn't gate LP.
     boot_n = int(os.environ.get("BOOTSTRAP_N", "1000"))
     if boot_n > 0:
-        print(f"[phase3] running {boot_n}x bootstrap for LP CIs...")
+        print(f"[cls-tcga-ot] running {boot_n}x bootstrap for LP CIs...")
         mean, std = bootstrap(results_dict=lp_outputs, n=boot_n)
         lp_boot = {k.split("/")[-1]: f"{mean[k]:.4f} ± {std[k]:.4f}" for k in mean}
-        print(f"[phase3] LP bootstrap: {lp_boot}")
+        print(f"[cls-tcga-ot] LP bootstrap: {lp_boot}")
         out["linear_probe_bootstrap"] = lp_boot
-        save_results("phase3_tcga_ot.json", out)
+        save_results("classification_tcga_ot.json", out)
 
     # --- Zero-shot needs the model (GPU). Skip gracefully if CUDA is down. ---
     import torch
     if not torch.cuda.is_available() and os.environ.get("ALLOW_CPU") != "1":
-        print("[phase3] CUDA unavailable -> skipping zero-shot (needs the model). "
+        print("[cls-tcga-ot] CUDA unavailable -> skipping zero-shot (needs the model). "
               "LP result saved. Recover GPU and re-run for zero-shot.")
-        print("[phase3] OK (linear probe only)")
+        print("[cls-tcga-ot] OK (linear probe only)")
         return
 
-    print("[phase3] === ZERO-SHOT ===")
+    print("[cls-tcga-ot] === ZERO-SHOT ===")
     model, device = load_titan()
     zs, zs_boot = run_zeroshot(model, device, task_config, test_csv, label_dict, target)
-    print(f"[phase3] ZS: bacc={zs.get('bacc'):.4f} auroc={zs.get('auroc')}")
-    print(f"[phase3] ZS bootstrap: {zs_boot}")
+    print(f"[cls-tcga-ot] ZS: bacc={zs.get('bacc'):.4f} auroc={zs.get('auroc')}")
+    print(f"[cls-tcga-ot] ZS bootstrap: {zs_boot}")
 
     out.update({"zero_shot": zs, "zero_shot_bootstrap": zs_boot})
-    save_results("phase3_tcga_ot.json", out)
-    print("[phase3] OK")
+    save_results("classification_tcga_ot.json", out)
+    print("[cls-tcga-ot] OK")
 
 
 if __name__ == "__main__":

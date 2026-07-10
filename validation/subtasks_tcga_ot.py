@@ -55,7 +55,7 @@ def linear_probe(tr, va, te, label_col="_y"):
     from joblib import Parallel, delayed
     from sklearn.preprocessing import LabelEncoder
     from titan.utils import get_eval_metrics
-    from phase3_tcga_ot import _fit_one
+    from classification_tcga_ot import _fit_one
 
     le = LabelEncoder().fit(pd.concat([tr[label_col], va[label_col], te[label_col]]))
     def XY(d): return np.stack(d["emb"].values), le.transform(d[label_col])
@@ -128,7 +128,7 @@ def main():
               f"{r['linear_probe'].get('bacc'):>9.4f}{r['retrieval']['acc@1']:>8.4f}"
               f"{r['retrieval']['mvacc@3']:>7.4f}")
 
-    save_results("tcga_subtasks.json", results)
+    save_results("subtasks_tcga_ot.json", results)
     print("\n[subtasks] OK")
 
 

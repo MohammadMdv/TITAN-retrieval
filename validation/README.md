@@ -1,11 +1,11 @@
 # TITAN validation
 
-Reproduces the published TITAN zero-shot/linear-probe/retrieval numbers, then tests whether
-a SupCon-trained projection head on top of frozen TITAN embeddings improves retrieval.
+Reproduces the published TITAN zero-shot / linear-probe / retrieval numbers, then investigates
+whether **patient-disjoint slide retrieval** can be improved beyond the frozen model.
 
-- `PLAN.md` — original scoping/design notes for the validation phases.
+- `PLAN.md` — original scoping/design notes.
 - `RESULTS.md` — numbers, compared against paper reference values.
-- `results/` — small JSON metric summaries per phase (checkpoints/embeddings are gitignored).
+- `results/` — JSON metric summaries per experiment (checkpoints/embeddings are gitignored).
 
 ## Setup
 
@@ -16,37 +16,60 @@ cp .env.example .env   # fill in HF_TOKEN (needs the gated MahmoodLab/TITAN lice
 python validation/download_assets.py   # pulls TITAN weights + TCGA_TITAN_features.pkl
 ```
 
-Optional env vars (see `common.py`): `CAMELYON16_ROOT` (only needed for phases 1/2/6/7 and
-`retrieval_camelyon_demo.py`, which use local CAMELYON16 CONCHv1.5 features), and
-`VALIDATION_RESULTS_DIR` to write outputs somewhere other than `validation/results/`.
+Optional env vars (see `common.py`): `CAMELYON16_ROOT` (needed only by the scripts that use
+local CAMELYON16 CONCHv1.5 features), and `VALIDATION_RESULTS_DIR` to write outputs elsewhere.
 
-## Phases
+## Scripts
+
+Named `<category>_<dataset>[_<technique>].py`.
 
 | Script | What it does |
 |---|---|
-| `phase1_smoke.py` | Slide-encoding smoke test on one local CAMELYON16 h5 |
-| `phase2_camelyon.py` | CAMELYON16 zero-shot + linear probe (binary tumor/normal) |
-| `phase3_tcga_ot.py` | TCGA-OT (46-class) zero-shot + linear probe, off precomputed embeddings |
-| `phase4_retrieval.py` | TCGA-OT slide retrieval (patient-disjoint), Acc@3 / MVAcc@3 |
-| `phase5_tcga_ut8k.py` | TCGA-UT-8K (32-class ROI) linear probe, subset |
-| `phase6_contrastive_feasibility.py` | Feasibility probe: does InfoNCE fine-tuning fit in VRAM (TITAN forward pass included) |
-| `phase7_supcon_vram_smoke.py` | Same VRAM question, but for a head-only SupCon step (no TITAN forward pass) |
-| `phase8_finetune_supcon.py` | Trains a projection head on frozen TCGA-OT embeddings with SupCon |
-| `phase9_eval_before_after.py` | Before/after LP + retrieval eval of the phase 8 head vs. raw embeddings |
-| `phase9b_checkpoint_sweep.py` | Same eval swept across phase 8's per-epoch checkpoints |
-| `tcga_subtasks.py` | Harder patient-disjoint TCGA-OT sub-typing tasks (extra, off the same pkl) |
-| `retrieval_camelyon_demo.py` | TITAN retrieval vs. an external PathSearch comparison run |
+| `smoke_slide_encoding.py` | Slide-encoding smoke test on one local CAMELYON16 h5 |
+| `classification_camelyon16.py` | CAMELYON16 zero-shot + linear probe (binary tumor/normal) |
+| `classification_tcga_ot.py` | TCGA-OT (46-class) zero-shot + linear probe |
+| `classification_tcga_ut8k.py` | TCGA-UT-8K (32-class ROI) linear probe, subset |
+| `retrieval_tcga_ot.py` | **Baseline**: TCGA-OT retrieval (patient-disjoint), raw cosine |
+| `retrieval_tcga_ot_whitening.py` | Tier-1: centering / PCA / PCA-whitening / ZCA |
+| `retrieval_tcga_ot_kreciprocal.py` | Tier-1: k-reciprocal re-ranking (Zhong et al. 2017) |
+| `retrieval_tcga_ot_query_expansion.py` | Tier-1: αQE and DBA (reported separately) |
+| `retrieval_camelyon16.py` | TITAN retrieval vs. an external PathSearch comparison run |
+| `subtasks_tcga_ot.py` | Harder patient-disjoint TCGA-OT sub-typing tasks |
+| `common.py`, `retrieval_common.py` | Shared paths/model loading; shared retrieval protocol + metrics |
+| `download_assets.py`, `ut8k_label_recon.py` | Asset download; TCGA-UT-8K label recon |
 | `make_results.py` | Aggregates `results/*.json` into `RESULTS.md` |
 
-`run_all.sh` runs phases 2→4 plus `make_results.py`.
+`run_all.sh` runs the classification, baseline-retrieval, and Tier-1 experiments.
 
-## Finding: SupCon fine-tuning doesn't improve retrieval
+## Retrieval protocol
 
-Phases 8/9/9b test fine-tuning a small frozen-TITAN projection head with SupCon (a
-*supervised* contrastive loss, using the same OncoTreeCode labels the linear probe targets —
-not self-supervised pretraining). Result: the head overfits within a handful of epochs, and
-retrieval Acc@3/MVAcc@3 degrade monotonically with further training while linear-probe
-accuracy stays roughly flat. See `RESULTS.md` for the full sweep. Likely cause: SupCon
-optimizes batch-local relative similarity (128 in-batch samples), while the retrieval metric
-depends on global all-pairs structure across the whole database — the two aren't the same
-objective, and a free nonlinear head has little to keep it aligned with the latter.
+Every retrieval experiment uses the identical protocol, so deltas isolate the technique:
+
+- **database** = train split, minus any slide whose `case_id` appears in val or test
+- **val queries** = val split — used *only* to select hyperparameters
+- **test queries** = test split — used *once*, to report the selected config
+
+Patient (`case_id`) disjointness between the database and both query sets is asserted at load
+time. The database is fixed, so a config tuned on val transfers to test unchanged.
+
+## Findings
+
+**Tier-1 (training-free post-processing) does not improve retrieval.** Whitening, k-reciprocal
+re-ranking, and αQE/DBA were each tested in isolation on the frozen embeddings. None beat the
+raw-cosine baseline on Acc@3. Notably:
+
+- k-reciprocal's val-optimal λ is **1.0**, which by construction *is* plain cosine — the sweep
+  chose "don't re-rank." (λ=1.0 reproducing the baseline exactly is also the implementation's
+  sanity check, and it passes.)
+- Full whitening (`pcaw-*`, `zca`) actively *hurts* Acc@3, implying TITAN's high-variance
+  directions carry discriminative signal rather than nuisance variation — the usual motivation
+  for whitening does not hold in this vision-language-aligned space.
+- All three showed a small MVAcc@3 gain **on val** (+0.010–0.013). Re-selecting on MVAcc@3 and
+  re-testing showed those gains **do not transfer to test** — they were val-set noise.
+
+Taken with the earlier (now removed) SupCon projection-head experiment, which also failed, the
+picture is consistent: **TITAN's frozen embedding geometry is already near-optimal for this
+task**, and neither a learned head on top of it nor a training-free re-ranking of its output
+improves patient-disjoint retrieval on TCGA-OT. Improving further likely requires adapting the
+encoder itself (LoRA/adapters) or domain-adaptive continued pretraining on a large target-domain
+corpus — not post-hoc manipulation of its output vectors.

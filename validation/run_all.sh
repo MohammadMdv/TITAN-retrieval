@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Run TITAN validation phases 2->4 + results table. Live output (tqdm bars visible).
+# Run the TITAN validation suite + results table. Live output (tqdm bars visible).
 # Usage:  bash validation/run_all.sh   (activate your venv first, or set TITAN_PYTHON)
+#
+# Skips smoke_slide_encoding / classification_camelyon16 unless CAMELYON16_ROOT is set,
+# since those need local CAMELYON16 CONCHv1.5 features that are not part of this repo.
 set -u
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PY="${TITAN_PYTHON:-python}"
@@ -12,9 +15,19 @@ run() {
   echo "----- exit: $? -----"
 }
 
-run "PHASE 2  (CAMELYON16)"  phase2_camelyon.py
-run "PHASE 3  (TCGA-OT zero-shot + linear probe)"  phase3_tcga_ot.py
-run "PHASE 4  (TCGA-OT retrieval)"  phase4_retrieval.py
+if [ -n "${CAMELYON16_ROOT:-}" ]; then
+  run "CLASSIFICATION  (CAMELYON16)" classification_camelyon16.py
+else
+  echo "[skip] classification_camelyon16.py -- set CAMELYON16_ROOT to enable"
+fi
+
+run "CLASSIFICATION  (TCGA-OT zero-shot + linear probe)" classification_tcga_ot.py
+run "RETRIEVAL       (TCGA-OT baseline, patient-disjoint)" retrieval_tcga_ot.py
+
+# Tier-1: training-free retrieval post-processing on the frozen embeddings.
+run "RETRIEVAL TIER-1 (whitening / PCA)" retrieval_tcga_ot_whitening.py
+run "RETRIEVAL TIER-1 (k-reciprocal re-ranking)" retrieval_tcga_ot_kreciprocal.py
+run "RETRIEVAL TIER-1 (query expansion + DBA)" retrieval_tcga_ot_query_expansion.py
 
 echo ""; echo "########## RESULTS TABLE ##########"
 $PY make_results.py

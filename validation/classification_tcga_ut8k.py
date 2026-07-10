@@ -1,4 +1,4 @@
-"""Phase 5: TCGA-UT-8K (32-class ROI benchmark) — SUBSET validation of TITAN.
+"""TCGA-UT-8K classification: 32-class ROI benchmark — SUBSET validation of TITAN.
 
 TCGA-UT-8K is 25,495 ROIs of 8192x8192 px (377 GB raw, no precomputed features). We do a
 bounded, class-balanced SUBSET: stream a few ROIs per class, extract a TITAN embedding for
@@ -62,7 +62,7 @@ def tile_roi_to_embedding(pil_img, conch, eval_transform, model, device, tile=51
 def build_subset(model, conch, eval_transform, device):
     if EMB_CACHE.exists():
         d = torch.load(EMB_CACHE)
-        print(f"[phase5] loaded cached embeddings: { {k: len(v['y']) for k, v in d.items()} }")
+        print(f"[cls-ut8k] loaded cached embeddings: { {k: len(v['y']) for k, v in d.items()} }")
         return d
 
     from datasets import load_dataset
@@ -86,7 +86,7 @@ def build_subset(model, conch, eval_transform, device):
         for ex in pbar:
             n_stream += 1
             if n_stream > max_stream:
-                print(f"[phase5] {split}: hit MAX_STREAM={max_stream}"); break
+                print(f"[cls-ut8k] {split}: hit MAX_STREAM={max_stream}"); break
             lab = ex[LABEL_FIELD]
             if seen_class[lab] >= per_class:
                 continue
@@ -97,7 +97,7 @@ def build_subset(model, conch, eval_transform, device):
             pbar.set_postfix(collected=len(ys), classes=len(seen_class))
             # early stop: every class has its quota (needs a known class count; approx via plateau)
         out[split] = {"X": torch.stack(embs).numpy(), "y": np.array(ys), "patient": np.array(pts)}
-        print(f"[phase5] {split}: {len(ys)} ROIs over {len(set(ys))} classes "
+        print(f"[cls-ut8k] {split}: {len(ys)} ROIs over {len(set(ys))} classes "
               f"(streamed {n_stream})")
         torch.save(out, EMB_CACHE)  # incremental
     return out
@@ -141,19 +141,19 @@ def main():
     conch = conch.to(device).eval()
 
     data = build_subset(model, conch, eval_transform, device)
-    print("[phase5] === LINEAR PROBE (subset; paper 32-class bal.acc = 0.832) ===")
+    print("[cls-ut8k] === LINEAR PROBE (subset; paper 32-class bal.acc = 0.832) ===")
     res, n_classes = run_linear_probe(data)
-    print(f"[phase5] subset LP: bacc={res.get('bacc'):.4f} over {n_classes} classes "
+    print(f"[cls-ut8k] subset LP: bacc={res.get('bacc'):.4f} over {n_classes} classes "
           f"(train={len(data['train']['y'])}/val={len(data['val']['y'])}/test={len(data['test']['y'])})")
 
-    save_results("phase5_tcga_ut8k.json", {
+    save_results("classification_tcga_ut8k.json", {
         "n_classes_in_subset": n_classes,
         "counts": {s: int(len(data[s]["y"])) for s in data},
         "linear_probe": res,
         "reference": {"full_32class_bacc": 0.832},
         "note": "SUBSET of 25,495 ROIs; approximate vs paper. Tiled 512px, patient-disjoint enforced.",
     })
-    print("[phase5] OK")
+    print("[cls-ut8k] OK")
 
 
 if __name__ == "__main__":

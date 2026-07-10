@@ -1,4 +1,4 @@
-"""Phase 4: TCGA-OT slide retrieval (patient-disjoint).
+"""TCGA-OT slide retrieval (patient-disjoint).
 
 Database = train split, queries = test split (already case_id-disjoint; asserted).
 Metrics (K=3):
@@ -72,7 +72,7 @@ def main():
     n_drop = int((~keep).sum())
     Xdb, db_labels, db_cases, db_ids = Xdb[keep], db_labels[keep], db_cases[keep], db_ids[keep]
     assert set(db_cases).isdisjoint(set(q_cases)), "patient leakage: query case in database"
-    print(f"[phase4] DB={len(db_ids)} (dropped {n_drop} leaking) queries={len(q_ids)}")
+    print(f"[ret-tcga-ot] DB={len(db_ids)} (dropped {n_drop} leaking) queries={len(q_ids)}")
 
     # cosine similarity
     Xdb_n = Xdb / (np.linalg.norm(Xdb, axis=1, keepdims=True) + 1e-8)
@@ -80,15 +80,15 @@ def main():
     sim = Xq_n @ Xdb_n.T  # queries x db
 
     acc3, mv3 = topk_metrics(sim, db_labels, q_labels, K=K)
-    print(f"[phase4] Acc@{K}={acc3:.4f} (ref 0.880)  MVAcc@{K}={mv3:.4f} (ref 0.807)")
+    print(f"[ret-tcga-ot] Acc@{K}={acc3:.4f} (ref 0.880)  MVAcc@{K}={mv3:.4f} (ref 0.807)")
 
-    save_results("phase4_retrieval.json", {
+    save_results("retrieval_tcga_ot.json", {
         "K": K, "db_size": len(db_ids), "n_queries": len(q_ids), "n_leaking_dropped": n_drop,
         "acc@3": acc3, "mvacc@3": mv3,
         "reference": {"acc@3": 0.880, "mvacc@3": 0.807},
         "patient_disjoint_asserted": True,
     })
-    print("[phase4] OK")
+    print("[ret-tcga-ot] OK")
 
 
 if __name__ == "__main__":

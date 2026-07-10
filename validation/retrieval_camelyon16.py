@@ -66,7 +66,7 @@ def main():
     if not QR:
         print("[demo] set PATHSEARCH_QUERY_CSV to the PathSearch query-results CSV to run this comparison."); return 1
     if not CACHE.exists():
-        print(f"[demo] missing {CACHE}; run phase2_camelyon.py first."); return 1
+        print(f"[demo] missing {CACHE}; run classification_camelyon16.py first."); return 1
     d = torch.load(CACHE)
     emb = d["emb"].numpy().astype(np.float32)          # (100, 768)
     ids = np.array(d["ids"])
@@ -79,7 +79,7 @@ def main():
     Xq = np.stack([id2emb[s] for s in q_ids]); q_labels = np.array([queries[s] for s in q_ids])
     # database labels from filename prefix mapping via reference.csv-consistent scheme:
     # reuse Phase 2's cached label semantics — infer from the same reference file
-    import phase2_camelyon as p2
+    import classification_camelyon16 as p2
     ref = p2.load_labels()
     Xdb = np.stack([id2emb[s] for s in db_ids]); db_labels = np.array([ref[s] for s in db_ids])
 
@@ -113,7 +113,7 @@ def main():
         for metric in ("top1", "top3_mv", "top5_mv"):
             print(f"  {c:6s} {metric:8s}{cos_per[c][metric]:>10.4f}{euc_per[c][metric]:>10.4f}{PATHSEARCH[c][metric]:>12.4f}")
 
-    save_results("retrieval_camelyon_demo.json", {
+    save_results("retrieval_camelyon16.json", {
         "n_queries": len(q_ids), "n_database": len(db_ids),
         "titan_cosine": {"overall": cos_overall, "per_class": cos_per},
         "titan_euclidean": {"overall": euc_overall, "per_class": euc_per},

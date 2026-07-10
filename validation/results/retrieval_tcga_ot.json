@@ -1,0 +1,13 @@
+{
+  "K": 3,
+  "db_size": 8226,
+  "n_queries": 1348,
+  "n_leaking_dropped": 0,
+  "acc@3": 0.8716617210682492,
+  "mvacc@3": 0.7811572700296736,
+  "reference": {
+    "acc@3": 0.88,
+    "mvacc@3": 0.807
+  },
+  "patient_disjoint_asserted": true
+}
