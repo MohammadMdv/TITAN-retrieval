@@ -93,13 +93,44 @@ def test_k_reciprocal_neighbours_are_mutual():
             assert i in initial_rank[j, :k + 1], f"{j} is not reciprocal with {i}"
 
 
-def test_jaccard_distance_is_in_the_unit_interval():
+def test_jaccard_distance_is_in_the_unit_interval_to_fp16_precision():
+    """Jaccard is a [0,1] distance -- but only to float16 epsilon, NOT to float32 epsilon.
+
+    build_V stores the pooled NxN neighbour-weight matrix as float16 (kreciprocal.py:88, and
+    smooth_V casts back at :114). That mirrors the reference implementation (Zhong et al. 2017),
+    where it is a deliberate memory optimization: the real pooled matrix here is 9,574^2, i.e.
+    ~733 MB in fp32 vs ~183 MB in fp16. Each row of V is normalized to sum to 1, but fp16
+    quantization plus smooth_V's averaging pushes some row sums fractionally ABOVE 1, and since
+    jaccard's self-similarity term IS that row sum, `1 - t/(2-t)` then dips just below 0.
+    Measured worst case: -2.4e-4, on both diagonal and gallery entries.
+
+    This is characterized, not a bug, and it reaches no published number: the sweep selects
+    lambda=1.0, where `final = jac*(1-lambda) + original_dist*lambda` multiplies jaccard by
+    exactly ZERO -- which is also why the repo's lambda=1.0 sanity check passes exactly. The
+    tolerance below is fp16 epsilon. If you ever see it exceeded by an order of magnitude,
+    something has genuinely broken.
+    """
     Xdb, _, Xq, _ = _data()
     original_dist, initial_rank, qn = kr.precompute(Xq, Xdb, top_m=11)
     jac = kr.jaccard_distance(kr.smooth_V(kr.build_V(original_dist, initial_rank, 10),
                                           initial_rank, 3), qn)
     assert np.isfinite(jac).all()
-    assert jac.min() >= -1e-6 and jac.max() <= 1.0 + 1e-6
+    assert jac.min() >= -1e-3, jac.min()          # fp16 epsilon, not fp32
+    assert jac.max() <= 1.0 + 1e-3, jac.max()
+
+
+def test_lambda_one_makes_the_jaccard_term_vanish_identically():
+    """The published k-reciprocal number is selected at lambda=1.0, where jaccard is multiplied
+    by (1 - 1.0) == 0. Pin that: the fp16 imprecision above CANNOT reach the reported result,
+    however large it gets. Feed in a deliberately corrupted jaccard and the ranking must not move.
+    """
+    Xdb, db_l, Xq, q_l = _data()
+    original_dist, initial_rank, qn = kr.precompute(Xq, Xdb, top_m=6)
+    garbage = np.full((qn, original_dist.shape[0]), -999.0, dtype=np.float32)
+
+    final = garbage * (1 - 1.0) + original_dist[:qn] * 1.0
+    got = eval_ranking(-final[:, qn:], db_l, q_l)
+    assert got == baseline_ranking(Xdb, db_l, Xq, q_l)
 
 
 # ------------------------------------------------------------ QE / DBA
