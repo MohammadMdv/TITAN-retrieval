@@ -56,3 +56,56 @@ Notes:
 | BRCA_IDC_vs_ILC | 2 | 67 | 0.9048 | 0.9254 | 0.9403 |
 | Sarcoma_4way | 4 | 27 | 0.5333 | 0.4074 | 0.3704 |
 | Brain_GBM_vs_LGG | 2 | 43 | 0.8242 | 0.8605 | 0.8605 |
+
+## Retrieval Tier-3 — LoRA fine-tuning of the TITAN slide encoder (BRACS ROIs)
+
+Adapting the **slide-aggregation transformer itself** with LoRA, on an out-of-distribution,
+patient-disjoint, labeled cohort where the frozen model has real headroom: BRACS breast lesions,
+7 classes (N, PB, UDH, FEA, ADH, DCIS, IC), 4,539 ROIs. CONCHv1.5 (patch encoder) stays frozen;
+only the 6-block slide transformer is trained. Pipeline: `download_bracs.py --set roi` →
+`cache_bracs_patch_features.py` (one-time CONCH patch cache) → `finetune_bracs_lora.py`.
+Protocol: DB = train (3,657), queries = val (312, selection) / test (570, reported). Loss =
+Proxy-Anchor (7 class proxies); trainable = LoRA (r=8, α=16) on the 24 block Linears
+(`attn.qkv, attn.proj, mlp.fc1, mlp.fc2` × 6), 589,824 params. fp32 (the TITAN RTX has no bf16,
+and Proxy-Anchor's `exp(α·cos)` terms overflow fp16). Model selected on **val retrieval** (not
+val loss); 3 seeds.
+
+**Result: a real but modest win — LoRA beats the frozen baseline and every training-free /
+head-only control.** Test set, 570 patient-disjoint queries:
+
+| Method | trained? | Acc@1 | Acc@3 | MVAcc@3 |
+|---|---|---|---|---|
+| Frozen TITAN (fp16 = fp32 LoRA-off) | no | 0.5053 | 0.7158 | 0.5281 |
+| mean-CONCH-kNN (naive mean-pool, no aggregation) | no | 0.5246 | 0.7456 | 0.5474 |
+| Frozen-embedding linear map + Proxy-Anchor | yes (3s) | 0.5123 | 0.7421 | 0.5251 |
+| mean-CONCH linear map + Proxy-Anchor | yes (3s) | 0.5023 | 0.7333 | 0.5339 |
+| **Block-LoRA + Proxy-Anchor** | **yes (3s)** | **0.5368 ±0.015** | **0.7573 ±0.002** | **0.5632 ±0.009** |
+
+- **Acc@3 is the robust signal**: +0.042 over baseline with seed std 0.002 (all seeds 0.754–0.760).
+- **Acc@1**: +0.032 mean; mean−std (0.522) clears baseline. Paired bootstrap (per-query, same
+  DB) vs the fp32 LoRA-off baseline: seed deltas +0.021 / +0.053 / +0.021; the **val-selected
+  best seed is the significant one** (Δ+0.053, CI [+0.014, +0.089] excludes 0), the other two
+  CIs include 0. So Acc@1 is positive-but-marginal per-seed, decisive only for the model you'd
+  actually pick.
+- **Beats the head-only controls** (frozen-map 0.512, mean-CONCH 0.525) on every metric →
+  adapting the encoder adds value beyond a linear reprojection or mean-pool. The
+  encoder-adaptation thesis survives this stress test.
+
+**Where the gains come from (per-class Acc@1, baseline → LoRA mean):**
+DCIS 0.494→0.600 (+0.106), N 0.543→0.617 (+0.074), PB 0.418→0.468 (+0.051); IC/FEA/ADH ≈ flat;
+UDH 0.305→0.276 (−0.028). LoRA re-aggregates to help mid-difficulty classes where patch signal
+exists, but does **not** crack the atypical ADH/UDH pair — consistent with the frozen confusion
+matrix, where ADH/UDH/DCIS retrieve each other 56–80% of the time. That inseparability is
+**CONCH-level** (the frozen patch features), which an aggregator LoRA cannot fix.
+
+**Context — why this ROI result matters despite being modest.** The Step-0 diagnostic showed
+naive mean-pooling *ties* TITAN's learned aggregator here (0.525 vs 0.505 Acc@1): on tiny ROIs
+(33% are ≤2 patches) the aggregator has little to do, so the ceiling is low by construction.
+That LoRA still beats mean-pool on this stress test is the encouraging part — on full gigapixel
+WSIs, where the aggregator does the heavy lifting, the expected payoff is larger. Overfitting
+appeared exactly as predicted (train loss falls past ~epoch 5 while val Acc@3 declines); early
+stopping on val retrieval caught it every seed.
+
+Artifacts: `results/finetune_bracs_lora_step3.json` (per-seed metrics + paired tests),
+`results/finetune_bracs_lora_step0_{confusion,controls}.json`,
+`results/finetune_bracs_lora_baseline_fp16.json`.

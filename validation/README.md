@@ -37,7 +37,11 @@ Named `<category>_<dataset>[_<technique>].py`.
 | `subtasks_tcga_ot.py` | Harder patient-disjoint TCGA-OT sub-typing tasks |
 | `common.py`, `retrieval_common.py` | Shared paths/model loading; shared retrieval protocol + metrics |
 | `download_assets.py`, `ut8k_label_recon.py` | Asset download; TCGA-UT-8K label recon |
-| `download_bracs.py` | Patient-disjoint, budget-capped BRACS WSI subset download (FTP, resumable) |
+| `download_bracs.py` | Patient-disjoint BRACS download (FTP, resumable); `--set roi` for the ROI set |
+| `extract_bracs_features.py` | One frozen TITAN embedding per BRACS ROI (40x→20x downsample) |
+| `cache_bracs_patch_features.py` | One-time CONCH patch-feature cache (LoRA input; `.npz` per ROI) |
+| `retrieval_bracs.py` | **Baseline**: BRACS ROI retrieval (patient-disjoint), raw cosine |
+| `finetune_bracs_lora.py` | Tier-3: `--mode {confusion,control,baseline,lora}` — Step 0 diagnostics/controls, fp32 LoRA-off baseline, and Block-LoRA + Proxy-Anchor fine-tuning |
 | `make_results.py` | Aggregates `results/*.json` into `RESULTS.md` |
 
 `run_all.sh` runs the classification, baseline-retrieval, and Tier-1 experiments.
@@ -74,3 +78,15 @@ task**, and neither a learned head on top of it nor a training-free re-ranking o
 improves patient-disjoint retrieval on TCGA-OT. Improving further likely requires adapting the
 encoder itself (LoRA/adapters) or domain-adaptive continued pretraining on a large target-domain
 corpus — not post-hoc manipulation of its output vectors.
+
+**Tier-3 (encoder LoRA) does improve retrieval — modestly, on an out-of-distribution cohort.**
+On BRACS breast-lesion ROIs (patient-disjoint, 7 classes), Block-LoRA + Proxy-Anchor on the
+frozen-CONCH slide encoder lifts test Acc@3 from 0.716 to **0.757 ± 0.002** (3 seeds) and Acc@1
+from 0.505 to **0.537 ± 0.015**, beating both a training-free mean-pool of CONCH patches (0.525)
+and a trained linear map on the frozen embeddings (0.512). The gains concentrate on
+mid-difficulty classes (DCIS, N, PB); the genuinely inseparable atypical pair (ADH/UDH) does not
+move — that confusion is CONCH-level and no aggregator LoRA can fix it. A Step-0 diagnostic found
+naive mean-pooling *ties* TITAN's aggregator on these tiny ROIs, so the ceiling here is low by
+construction; the value of the result is as a stress-test validation before applying LoRA to
+full gigapixel WSIs, where the aggregator matters far more. See RESULTS.md (Tier-3) for the full
+table, per-class breakdown, and paired significance tests.
