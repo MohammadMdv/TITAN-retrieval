@@ -19,19 +19,62 @@ def delta(x, base):
     return f"{x - base:+.4f}"
 
 
+def split_sections(text):
+    """Parse a RESULTS.md into (preamble_lines, [(title, [body_lines]), ...]) by `## ` heading."""
+    preamble, sections, cur = [], [], None
+    for line in text.splitlines():
+        if line.startswith("## "):
+            cur = (line[3:].strip(), [line])
+            sections.append(cur)
+        elif cur is None:
+            preamble.append(line)
+        else:
+            cur[1].append(line)
+    return preamble, sections
+
+
+def merge(old_text, preamble, generated):
+    """RESULTS.md is update-only: regenerate what we can, carry everything else through.
+
+    `generated` is an ordered [(title, [lines])]. Any section present in `old_text` but not in
+    `generated` (a hand-written analysis section, or one whose result JSON is absent on this
+    machine) is preserved verbatim, in its original position. Sections we generate for the
+    first time are appended in generator order.
+    """
+    gen = dict(generated)
+    _, old_sections = split_sections(old_text)
+    out, emitted = list(preamble), set()
+
+    for title, body in old_sections:              # keep the old file's section order
+        if title in gen:
+            out += gen[title]
+        else:
+            print(f"[make_results] preserved (not generated): {title}")
+            out += body
+        emitted.add(title)
+
+    for title, body in generated:                 # new sections we've never written before
+        if title not in emitted:
+            out += body
+
+    return "\n".join(out).rstrip() + "\n"
+
+
 def main():
-    lines = ["# TITAN Validation Results", "",
-             "Reference numbers from the TITAN Nature Medicine paper / repo README.", ""]
+    preamble = ["# TITAN Validation Results", "",
+                "Reference numbers from the TITAN Nature Medicine paper / repo README.", ""]
+    generated = []
 
     smoke = load("smoke_slide_encoding.json")
     if smoke:
-        lines += ["## Smoke test — slide encoding",
+        lines = ["## Smoke test — slide encoding",
                   f"- sample: `{smoke['sample']}`  embedding shape: {smoke['embedding_shape']}  "
                   f"patch_size_lv0: {smoke['patch_size_lv0']}  finite: {smoke['finite']}", ""]
+        generated.append(("Smoke test — slide encoding", lines))
 
     cam = load("classification_camelyon16.json")
     if cam:
-        lines += ["## Classification — CAMELYON16 binary (tumor vs normal)",
+        lines = ["## Classification — CAMELYON16 binary (tumor vs normal)",
                   f"- {cam['n_slides']} slides ({cam['n_normal']} normal / {cam['n_tumor']} tumor). "
                   f"_Caveat: 512px@40x features (CONCHv1.5 expects ~20x); not a TITAN-designed task._",
                   "",
@@ -40,11 +83,12 @@ def main():
                   f"| Zero-shot | {fmt(cam['zero_shot'].get('bacc'))} | {fmt(cam['zero_shot'].get('auroc'))} |",
                   f"| Linear probe | {fmt(cam['linear_probe'].get('bacc'))} | {fmt(cam['linear_probe'].get('auroc'))} |",
                   f"- LP bootstrap: {cam.get('linear_probe_bootstrap')}", ""]
+        generated.append(("Classification — CAMELYON16 binary (tumor vs normal)", lines))
 
     ot = load("classification_tcga_ot.json")
     if ot:
         lp, zs = ot["linear_probe"], ot.get("zero_shot")
-        lines += ["## Classification — TCGA-OT (46-class, full WSIs)",
+        lines = ["## Classification — TCGA-OT (46-class, full WSIs)",
                   "| Setting | Balanced acc | Reference | AUROC | Kappa |",
                   "|---|---|---|---|---|",
                   f"| Linear probe | {fmt(lp.get('bacc'))} | **0.704** | {fmt(lp.get('auroc'))} | {fmt(lp.get('kappa'))} |"]
@@ -52,10 +96,11 @@ def main():
             lines.append(f"| Zero-shot | {fmt(zs.get('bacc'))} | — | {fmt(zs.get('auroc'))} | {fmt(zs.get('kappa'))} |")
         lines += [f"- LP bootstrap: {ot.get('linear_probe_bootstrap')}",
                   f"- ZS bootstrap: {ot.get('zero_shot_bootstrap')}", ""]
+        generated.append(("Classification — TCGA-OT (46-class, full WSIs)", lines))
 
     ret = load("retrieval_tcga_ot.json")
     if ret:
-        lines += ["## Retrieval — TCGA-OT slide retrieval (patient-disjoint)",
+        lines = ["## Retrieval — TCGA-OT slide retrieval (patient-disjoint)",
                   f"- DB={ret['db_size']}  queries={ret['n_queries']}  "
                   f"leaking patients dropped={ret['n_leaking_dropped']}  "
                   f"disjoint asserted={ret['patient_disjoint_asserted']}",
@@ -64,6 +109,7 @@ def main():
                   "|---|---|---|",
                   f"| Acc@3 | {fmt(ret['acc@3'])} | **0.880** |",
                   f"| MVAcc@3 | {fmt(ret['mvacc@3'])} | **0.807** |", ""]
+        generated.append(("Retrieval — TCGA-OT slide retrieval (patient-disjoint)", lines))
 
     # ---- Tier-1: training-free retrieval post-processing on frozen embeddings ----
     tier1 = [("Whitening / PCA", "retrieval_tcga_ot_whitening.json"),
@@ -72,7 +118,7 @@ def main():
              ("Database-side augmentation (DBA)", "retrieval_tcga_ot_query_expansion.json")]
     loaded = {n: load(f) for _, f in tier1 for n in [f]}
     if any(loaded.values()):
-        lines += ["## Retrieval Tier-1 — training-free post-processing (negative result)",
+        lines = ["## Retrieval Tier-1 — training-free post-processing (negative result)",
                   "",
                   "Three standard image-retrieval techniques applied to the **frozen** TITAN "
                   "embeddings. Nothing is trained; only the search procedure changes. "
@@ -120,20 +166,42 @@ def main():
                   "transfer to test** — all four flip negative (whitening −0.0074, k-reciprocal "
                   "−0.0015, αQE −0.0067, DBA −0.0037). They were val-set noise, not signal. "
                   "Those runs are saved alongside as `*_sel-mvacc3.json`.", ""]
+        generated.append(("Retrieval Tier-1 — training-free post-processing (negative result)", lines))
 
     sub = load("subtasks_tcga_ot.json")
     if sub:
-        lines += ["## Sub-tasks — harder patient-disjoint TCGA-OT sub-typing", "",
+        lines = ["## Sub-tasks — harder patient-disjoint TCGA-OT sub-typing", "",
                   "| Task | #cls | test n | LP bacc | Ret Acc@1 | MVAcc@3 |", "|---|---|---|---|---|---|"]
         for name, r in sub.items():
             lines.append(f"| {name} | {len(r['classes'])} | {r['n']['test']} | "
                          f"{fmt(r['linear_probe'].get('bacc'))} | {fmt(r['retrieval']['acc@1'])} | "
                          f"{fmt(r['retrieval']['mvacc@3'])} |")
         lines.append("")
+        generated.append(("Sub-tasks — harder patient-disjoint TCGA-OT sub-typing", lines))
 
-    OUT.write_text("\n".join(lines))
+    bracs = load("retrieval_bracs.json")
+    if bracs:
+        te, ch = bracs["test"], bracs["chance"]
+        body = ["## Retrieval — BRACS ROI (patient-disjoint baseline)", "",
+                f"Frozen TITAN, raw cosine. DB(train)={bracs['n']['db']}  "
+                f"val_q={bracs['n']['val']}  test_q={bracs['n']['test']}  "
+                f"{len(bracs['classes'])} classes.",
+                "",
+                "| Metric | Test | Chance (random retrieval) | Chance (majority class) |",
+                "|---|---|---|---|",
+                f"| Acc@1 | {fmt(te['metrics']['acc@1'])} | "
+                f"{fmt(ch['random_retrieval_acc@1'])} | {fmt(ch['majority_class_acc@1'])} |",
+                f"| Acc@3 | {fmt(te['metrics']['acc@3'])} | — | — |",
+                f"| MVAcc@3 | {fmt(te['metrics']['mvacc@3'])} | — | — |",
+                "",
+                "Per-class Acc@1: " + ", ".join(
+                    f"{c}={v:.3f}" for c, v in te["per_class_acc@1"].items()),
+                ""]
+        generated.append(("Retrieval — BRACS ROI (patient-disjoint baseline)", body))
+
+    old = OUT.read_text() if OUT.exists() else ""
+    OUT.write_text(merge(old, preamble, generated))
     print(f"[make_results] wrote {OUT}")
-    print("\n".join(lines))
 
 
 if __name__ == "__main__":

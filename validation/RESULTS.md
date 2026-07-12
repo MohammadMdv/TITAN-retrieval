@@ -109,3 +109,14 @@ stopping on val retrieval caught it every seed.
 Artifacts: `results/finetune_bracs_lora_step3.json` (per-seed metrics + paired tests),
 `results/finetune_bracs_lora_step0_{confusion,controls}.json`,
 `results/finetune_bracs_lora_baseline_fp16.json`.
+## Retrieval — BRACS ROI (patient-disjoint baseline)
+
+Frozen TITAN, raw cosine. DB(train)=3657  val_q=312  test_q=570  7 classes.
+
+| Metric | Test | Chance (random retrieval) | Chance (majority class) |
+|---|---|---|---|
+| Acc@1 | 0.5053 | 0.1431 | 0.1491 |
+| Acc@3 | 0.7158 | — | — |
+| MVAcc@3 | 0.5281 | — | — |
+
+Per-class Acc@1: ADH=0.278, DCIS=0.494, FEA=0.675, IC=0.815, N=0.543, PB=0.418, UDH=0.305
