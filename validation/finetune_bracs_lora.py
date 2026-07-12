@@ -25,6 +25,7 @@ from tqdm import tqdm
 
 from common import load_titan, get_device, save_results, TITAN_ROOT
 from retrieval_bracs import load_split, evaluate, chance_references, FEAT_PKL
+from retrieval_common import cosine_sim, l2_normalize
 
 BRACS_ROOT = TITAN_ROOT / "data" / "BRACS"
 MANIFEST = BRACS_ROOT / "manifest_roi.csv"
@@ -116,6 +117,83 @@ def run_eval(df, tag):
     return results
 
 
+def mean_conch_df(manifest):
+    """Mean-pool the cached CONCH patch features per ROI (masking zero-pads via n_real) ->
+    DataFrame with the frozen-pkl schema. Throws away TITAN's aggregation entirely."""
+    ids, embs = list(manifest["item_id"]), []
+    for item_id in ids:
+        features, _, n_real = load_patch(item_id)
+        embs.append(features[:n_real].mean(axis=0).astype(np.float32))  # pads excluded
+    return pd.DataFrame({
+        "item_id": ids, "patient_id": list(manifest["patient_id"]),
+        "label": list(manifest["label"]), "split": list(manifest["official_split"]),
+        "embedding": embs,
+    })
+
+
+def confusion_matrix(sim, db_labels, q_labels, classes):
+    """Top-1 retrieval confusion: rows = query true class, cols = retrieved top-1 class,
+    values = fraction of that class's queries. Also returns raw counts."""
+    top1 = db_labels[np.argmax(sim, axis=1)]
+    idx = {c: i for i, c in enumerate(classes)}
+    counts = np.zeros((len(classes), len(classes)), dtype=int)
+    for t, p in zip(q_labels, top1):
+        counts[idx[t], idx[p]] += 1
+    frac = counts / counts.sum(axis=1, keepdims=True).clip(min=1)
+    return counts, frac
+
+
+def print_confusion(frac, classes, title):
+    print(f"\n[lora] {title}  (row=true, col=top-1 retrieved; diagonal=Acc@1)")
+    print("        " + "  ".join(f"{c:>5}" for c in classes))
+    for i, c in enumerate(classes):
+        row = "  ".join(f"{frac[i, j]:5.2f}" for j in range(len(classes)))
+        print(f"  {c:>5} {row}")
+
+
+def mode_confusion(args):
+    """Step 0.1 + 0.3a (training-free): frozen-TITAN test confusion matrix, and mean-CONCH-kNN
+    vs frozen-TITAN retrieval (the sharp 'does TITAN's aggregator beat naive mean-pool?' test).
+    Runs on CPU from the pkl + patch cache; no training, no model load."""
+    if not FEAT_PKL.exists():
+        sys.exit(f"[lora] {FEAT_PKL} not found -- run extract_bracs_features.py first.")
+    frozen = pd.read_pickle(FEAT_PKL)
+    Xtr, ytr, ctr, _ = load_split(frozen, "train")
+    Xte, yte, cte, _ = load_split(frozen, "test")
+    classes = sorted(set(ytr))
+
+    sim = cosine_sim(Xte, Xtr)
+    counts, frac = confusion_matrix(sim, ytr, yte, classes)
+    print_confusion(frac, classes, "FROZEN TITAN — test top-1 confusion")
+    # atypical/borderline block the plan flagged: do ADH/UDH/DCIS mostly retrieve each other?
+    block = ["ADH", "UDH", "DCIS"]
+    bi = [classes.index(c) for c in block]
+    for c, i in zip(block, bi):
+        within = counts[i, bi].sum()
+        total = counts[i].sum()
+        print(f"[lora]   {c}: {within}/{total} = {within/max(total,1):.2f} of top-1 land in "
+              f"{{ADH,UDH,DCIS}}")
+
+    # mean-CONCH-kNN vs frozen-TITAN: if naive mean-pool ~= TITAN, the aggregator adds nothing.
+    manifest = pd.read_csv(MANIFEST)
+    mc = mean_conch_df(manifest)
+    print("\n[lora] mean-CONCH-kNN (no TITAN aggregation, no training):")
+    mc_results = run_eval(mc, "mean-conch-knn")
+    print("[lora] frozen-TITAN test Acc@1=0.5053 (Step 2). If mean-CONCH ~= this, the "
+          "aggregator is not the lever.")
+
+    frozen_results = run_eval(frozen, "frozen-titan")
+    save_results("finetune_bracs_lora_step0_confusion.json", {
+        "classes": classes,
+        "frozen_titan_test_confusion_counts": counts.tolist(),
+        "frozen_titan_test_confusion_frac": frac.tolist(),
+        "mean_conch_knn": mc_results,
+        "frozen_titan": frozen_results,
+    })
+    print("[lora] Step-0 confusion + mean-CONCH-kNN saved.")
+    print("[lora] OK")
+
+
 def mode_baseline(args):
     meta = load_meta()
     tile = meta["tile"]
@@ -149,11 +227,13 @@ def mode_baseline(args):
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", default="baseline", choices=["baseline"])
-    ap.add_argument("--dtype", default="bf16", choices=list(DTYPES))
+    ap.add_argument("--mode", default="baseline", choices=["baseline", "confusion"])
+    ap.add_argument("--dtype", default="fp16", choices=list(DTYPES))
     args = ap.parse_args()
     if args.mode == "baseline":
         mode_baseline(args)
+    elif args.mode == "confusion":
+        mode_confusion(args)
 
 
 if __name__ == "__main__":
