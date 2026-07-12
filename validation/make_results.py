@@ -45,17 +45,22 @@ def merge(old_text, preamble, generated):
     _, old_sections = split_sections(old_text)
     out, emitted = list(preamble), set()
 
+    def _emit(body):
+        if out and out[-1].strip():      # guarantee a blank line between sections
+            out.append("")
+        out.extend(body)
+
     for title, body in old_sections:              # keep the old file's section order
         if title in gen:
-            out += gen[title]
+            _emit(gen[title])
         else:
             print(f"[make_results] preserved (not generated): {title}")
-            out += body
+            _emit(body)
         emitted.add(title)
 
     for title, body in generated:                 # new sections we've never written before
         if title not in emitted:
-            out += body
+            _emit(body)
 
     return "\n".join(out).rstrip() + "\n"
 

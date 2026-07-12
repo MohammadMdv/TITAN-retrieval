@@ -109,6 +109,7 @@ stopping on val retrieval caught it every seed.
 Artifacts: `results/finetune_bracs_lora_step3.json` (per-seed metrics + paired tests),
 `results/finetune_bracs_lora_step0_{confusion,controls}.json`,
 `results/finetune_bracs_lora_baseline_fp16.json`.
+
 ## Retrieval — BRACS ROI (patient-disjoint baseline)
 
 Frozen TITAN, raw cosine. DB(train)=3657  val_q=312  test_q=570  7 classes.

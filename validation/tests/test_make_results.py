@@ -23,3 +23,10 @@ def test_merge_on_empty_file_is_just_the_generated_sections():
     out = make_results.merge("", ["# T", ""], [("A", ["## A", "a", ""])])
     assert out.startswith("# T")
     assert "## A" in out
+
+
+def test_appended_section_is_separated_by_a_blank_line():
+    old = "# T\n\n## Kept\nhand-written analysis, no trailing blank"
+    generated = [("New", ["## New", "n", ""])]
+    out = make_results.merge(old, ["# T", ""], generated)
+    assert "no trailing blank\n\n## New" in out
