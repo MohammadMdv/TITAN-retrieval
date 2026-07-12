@@ -21,11 +21,32 @@ import sys
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from common import load_titan, get_device, save_results, TITAN_ROOT
 from retrieval_bracs import load_split, evaluate, chance_references, FEAT_PKL
-from retrieval_common import cosine_sim, l2_normalize
+from retrieval_common import cosine_sim, l2_normalize, eval_ranking
+
+
+def cosine_lr(optimizer, base_lr, warmup_length, steps):
+    """Cosine LR schedule with linear warmup. Copied from titan/finetune.py (which can't be
+    imported here -- it pulls in omegaconf). Honors an optional per-group `lr_scale`."""
+    def _assign(new_lr):
+        for g in optimizer.param_groups:
+            g["lr"] = new_lr * g.get("lr_scale", 1.0)
+
+    def _adjuster(step):
+        if step < warmup_length:
+            lr = base_lr * (step + 1) / warmup_length
+        else:
+            e, es = step - warmup_length, steps - warmup_length
+            lr = 0.5 * (1 + np.cos(np.pi * e / max(es, 1))) * base_lr
+        _assign(lr)
+        return lr
+
+    return _adjuster
 
 BRACS_ROOT = TITAN_ROOT / "data" / "BRACS"
 MANIFEST = BRACS_ROOT / "manifest_roi.csv"
@@ -194,6 +215,151 @@ def mode_confusion(args):
     print("[lora] OK")
 
 
+# --------------------------------------------------------------------------------------------
+# Proxy-Anchor metric-learning core (shared by the Step-0 controls and the Step-3 LoRA run)
+# --------------------------------------------------------------------------------------------
+class ProxyAnchor(nn.Module):
+    """Proxy-Anchor loss (Kim et al., CVPR 2020). One learnable proxy per class.
+
+    Proxies are L2-normalized every forward (so `emb @ P.T` is cosine). fp32 only: the
+    exp(alpha*(cos +/- delta)) terms peak near exp(35) ~ 2e15, fine for fp32, overflow for fp16.
+    Defaults alpha=32, delta=0.1 are the paper's. Proxies want a much higher LR than the map
+    params (handled by a param group with lr_scale)."""
+    def __init__(self, n_classes, dim, alpha=32.0, delta=0.1):
+        super().__init__()
+        self.proxies = nn.Parameter(torch.empty(n_classes, dim))
+        nn.init.kaiming_normal_(self.proxies, a=np.sqrt(5))
+        self.alpha, self.delta, self.C = alpha, delta, n_classes
+
+    def forward(self, emb, y_idx):
+        P = F.normalize(self.proxies, dim=1)
+        cos = emb @ P.t()                                        # [B, C], emb already normalized
+        onehot = F.one_hot(y_idx, self.C).float()               # [B, C]
+        pos, neg = onehot.bool(), ~onehot.bool()
+        pos_exp = torch.where(pos, torch.exp(-self.alpha * (cos - self.delta)), torch.zeros_like(cos))
+        neg_exp = torch.where(neg, torch.exp(self.alpha * (cos + self.delta)), torch.zeros_like(cos))
+        with_pos = onehot.sum(0) > 0                             # classes present in the batch
+        n_pos = with_pos.sum().clamp(min=1)
+        pos_term = (torch.log1p(pos_exp.sum(0))[with_pos]).sum() / n_pos
+        neg_term = (torch.log1p(neg_exp.sum(0))).sum() / self.C
+        return pos_term + neg_term
+
+
+def pk_batches(y_idx, n_classes, K, rng, K_replace=True):
+    """One epoch of PK batches with P = all classes present (so both loss terms stay non-empty).
+    Each batch = K samples per class -> batch size n_classes*K. Yields index arrays."""
+    by_class = [np.where(y_idx == c)[0] for c in range(n_classes)]
+    steps = max(1, len(y_idx) // (n_classes * K))
+    for _ in range(steps):
+        idx = [rng.choice(ci, size=K, replace=K_replace or len(ci) < K) for ci in by_class]
+        yield np.concatenate(idx)
+
+
+def val_signal(lin, Xtr_t, ytr, ctr, Xva_t, yva, cva):
+    """Smoothed val-retrieval selection score = mean(Acc@1, Acc@3), val queries vs train DB."""
+    with torch.no_grad():
+        Zdb = F.normalize(lin(Xtr_t), dim=1).cpu().numpy()
+        Zva = F.normalize(lin(Xva_t), dim=1).cpu().numpy()
+    m = eval_ranking(cosine_sim(Zva, Zdb), ytr, yva, k=3)
+    return 0.5 * (m["acc@1"] + m["acc@3"]), m
+
+
+def train_linear_map(Xtr, ytr, ctr, Xva, yva, cva, classes, device, seed,
+                     epochs=40, lr=1e-3, proxy_mult=100.0, K=8, patience=6, wd=1e-2):
+    """Train a single Linear(768->768) with Proxy-Anchor, selecting on val retrieval. The map is
+    initialized to identity so before training the retrieval == the untrained baseline."""
+    torch.manual_seed(seed); np.random.seed(seed)
+    rng = np.random.default_rng(seed)
+    D, C = Xtr.shape[1], len(classes)
+    cls_idx = {c: i for i, c in enumerate(classes)}
+    ytr_idx = np.array([cls_idx[c] for c in ytr])
+
+    lin = nn.Linear(D, D).to(device)
+    with torch.no_grad():
+        lin.weight.copy_(torch.eye(D)); lin.bias.zero_()        # identity init == no-op start
+    loss_fn = ProxyAnchor(C, D).to(device)
+    opt = torch.optim.AdamW(
+        [{"params": lin.parameters(), "weight_decay": wd},
+         {"params": loss_fn.parameters(), "weight_decay": 0.0, "lr_scale": proxy_mult}], lr=lr)
+    steps_per_epoch = max(1, len(Xtr) // (C * K))
+    sched = cosine_lr(opt, lr, warmup_length=int(steps_per_epoch * epochs * 0.1),
+                      steps=steps_per_epoch * epochs)
+
+    Xtr_t = torch.tensor(Xtr, device=device)
+    Xva_t = torch.tensor(Xva, device=device)
+    ytr_idx_t = torch.tensor(ytr_idx, device=device)
+
+    best_sig, best_state, bad, step = -1.0, None, 0, 0
+    for epoch in range(epochs):
+        lin.train()
+        for idx in pk_batches(ytr_idx, C, K, rng):
+            sched(step); step += 1
+            emb = F.normalize(lin(Xtr_t[idx]), dim=1)
+            loss = loss_fn(emb, ytr_idx_t[idx])
+            opt.zero_grad(); loss.backward(); opt.step()
+        lin.eval()
+        sig, m = val_signal(lin, Xtr_t, ytr, ctr, Xva_t, yva, cva)
+        if sig > best_sig + 1e-4:
+            best_sig, best_state, bad = sig, {k: v.clone() for k, v in lin.state_dict().items()}, 0
+        else:
+            bad += 1
+        if bad >= patience:
+            break
+    lin.load_state_dict(best_state)
+    lin.eval()
+    return lin, best_sig
+
+
+def map_embed(lin, X, device):
+    with torch.no_grad():
+        return F.normalize(lin(torch.tensor(X, device=device)), dim=1).cpu().numpy()
+
+
+def source_splits(source):
+    """Return (Xtr,ytr,ctr, Xva,yva,cva, Xte,yte,cte, classes) for a control source."""
+    if source == "frozen":
+        df = pd.read_pickle(FEAT_PKL)
+    elif source == "mean-conch":
+        df = mean_conch_df(pd.read_csv(MANIFEST))
+    else:
+        raise ValueError(source)
+    Xtr, ytr, ctr, _ = load_split(df, "train")
+    Xva, yva, cva, _ = load_split(df, "val")
+    Xte, yte, cte, _ = load_split(df, "test")
+    return Xtr, ytr, ctr, Xva, yva, cva, Xte, yte, cte, sorted(set(ytr))
+
+
+def mode_control(args):
+    """Step 0.2/0.3b: trained Linear(768->768) + Proxy-Anchor on frozen embeddings and on
+    mean-CONCH. Gives the ceiling of a metric-learning head in each space -- the bar LoRA must
+    clear to justify touching the encoder. Multi-seed; reports test mean +/- std vs baseline."""
+    device = get_device()
+    sources = ["frozen", "mean-conch"] if args.source == "both" else [args.source]
+    out = {"seeds": args.seeds, "baseline_frozen_test_acc@1": 0.5053}
+    for source in sources:
+        Xtr, ytr, ctr, Xva, yva, cva, Xte, yte, cte, classes = source_splits(source)
+        print(f"\n[lora] === trained control: {source}  (db={len(ytr)} val={len(yva)} "
+              f"test={len(yte)}, {args.seeds} seeds) ===")
+        per_seed = []
+        for seed in range(args.seeds):
+            lin, best_sig = train_linear_map(Xtr, ytr, ctr, Xva, yva, cva, classes, device, seed)
+            Zdb, Zte = map_embed(lin, Xtr, device), map_embed(lin, Xte, device)
+            metrics, per_class = evaluate(Zdb, ytr, ctr, Zte, yte, cte, f"{source}-test")
+            per_seed.append({"metrics": metrics, "per_class_acc@1": per_class,
+                             "val_sig": best_sig})
+            print(f"  seed {seed}: val_sig={best_sig:.4f}  test "
+                  + " ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+        keys = list(per_seed[0]["metrics"])
+        mean = {k: float(np.mean([s["metrics"][k] for s in per_seed])) for k in keys}
+        std = {k: float(np.std([s["metrics"][k] for s in per_seed])) for k in keys}
+        print(f"  [{source}] test mean+/-std: "
+              + "  ".join(f"{k}={mean[k]:.4f}+/-{std[k]:.4f}" for k in keys))
+        out[source] = {"per_seed": per_seed, "test_mean": mean, "test_std": std}
+    save_results("finetune_bracs_lora_step0_controls.json", out)
+    print("\n[lora] Step-0 trained controls saved. Bar for LoRA = best of these vs 0.5053.")
+    print("[lora] OK")
+
+
 def mode_baseline(args):
     meta = load_meta()
     tile = meta["tile"]
@@ -227,13 +393,18 @@ def mode_baseline(args):
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", default="baseline", choices=["baseline", "confusion"])
+    ap.add_argument("--mode", default="baseline", choices=["baseline", "confusion", "control"])
     ap.add_argument("--dtype", default="fp16", choices=list(DTYPES))
+    ap.add_argument("--source", default="both", choices=["frozen", "mean-conch", "both"],
+                    help="control mode: which feature space to train the linear map on")
+    ap.add_argument("--seeds", default=3, type=int, help="control mode: number of seeds")
     args = ap.parse_args()
     if args.mode == "baseline":
         mode_baseline(args)
     elif args.mode == "confusion":
         mode_confusion(args)
+    elif args.mode == "control":
+        mode_control(args)
 
 
 if __name__ == "__main__":
