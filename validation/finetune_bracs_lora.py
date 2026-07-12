@@ -360,6 +360,194 @@ def mode_control(args):
     print("[lora] OK")
 
 
+# --------------------------------------------------------------------------------------------
+# Step 3 — Block-LoRA on the TITAN slide encoder + Proxy-Anchor
+# --------------------------------------------------------------------------------------------
+def block_targets(model):
+    """The 24 block Linear names LoRA adapts: {attn.qkv, attn.proj, mlp.fc1, mlp.fc2} x 6."""
+    import torch.nn as nn
+    return [n for n, m in model.named_modules() if isinstance(m, nn.Linear)
+            and "blocks.modules_list." in n
+            and (n.endswith(".attn.qkv") or n.endswith(".attn.proj")
+                 or n.endswith(".mlp.fc1") or n.endswith(".mlp.fc2"))]
+
+
+def preload_cache(item_ids, device):
+    """All patch features/coords on GPU (fp32, ~85 MB) so per-ROI forwards have no H2D cost."""
+    cache = {}
+    for iid in item_ids:
+        f, c, _ = load_patch(iid)
+        cache[iid] = (torch.tensor(f, dtype=torch.float32, device=device),
+                      torch.tensor(c, dtype=torch.long, device=device))
+    return cache
+
+
+def enc_one(model, cache, iid, tile):
+    """One ROI -> 768-d slide embedding (with grad if model is training)."""
+    f, c = cache[iid]
+    return model.encode_slide_from_patch_features(f, c, tile).squeeze(0)
+
+
+@torch.no_grad()
+def embed_ids(model, cache, ids, tile):
+    model.eval()
+    return np.stack([enc_one(model, cache, i, tile).float().cpu().numpy() for i in ids])
+
+
+def retrieval_metrics(Zdb, ydb, cdb, Zq, yq, cq, name):
+    m, per_class = evaluate(Zdb, ydb, cdb, Zq, yq, cq, name)
+    return m, per_class
+
+
+def top1_correct(Zdb, ydb, Zq, yq):
+    sim = cosine_sim(Zq, Zdb)
+    return ydb[np.argmax(sim, axis=1)] == yq
+
+
+def paired_bootstrap(base_ok, lora_ok, n_boot=5000, seed=0):
+    """Paired bootstrap CI of the Acc@1 difference (lora - baseline) over the same queries,
+    plus McNemar discordant counts."""
+    rng = np.random.default_rng(seed)
+    diff = lora_ok.astype(int) - base_ok.astype(int)
+    n = len(diff)
+    boots = np.array([diff[rng.integers(0, n, n)].mean() for _ in range(n_boot)])
+    b = int(((base_ok) & (~lora_ok)).sum())    # baseline right, lora wrong
+    c = int(((~base_ok) & (lora_ok)).sum())    # baseline wrong, lora right
+    return {"delta_acc@1": float(diff.mean()),
+            "ci95": [float(np.percentile(boots, 2.5)), float(np.percentile(boots, 97.5))],
+            "mcnemar_b_base_only": b, "mcnemar_c_lora_only": c}
+
+
+def train_lora(model, peft_model, cache, tr_ids, ytr, ctr, va_ids, yva, cva, classes, tile,
+               device, seed, args):
+    """Train Block-LoRA + Proxy-Anchor, selecting on val retrieval; keep best-epoch adapter."""
+    from copy import deepcopy
+    torch.manual_seed(seed); np.random.seed(seed)
+    rng = np.random.default_rng(seed)
+    C = len(classes)
+    cls_idx = {c: i for i, c in enumerate(classes)}
+    ytr_idx = np.array([cls_idx[c] for c in ytr])
+    tr_ids = np.asarray(tr_ids)
+
+    loss_fn = ProxyAnchor(C, 768).to(device)
+    lora_params = [p for n, p in model.named_parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(
+        [{"params": lora_params, "weight_decay": args.wd},
+         {"params": loss_fn.parameters(), "weight_decay": 0.0, "lr_scale": args.proxy_mult}],
+        lr=args.lr)
+    steps_per_epoch = max(1, len(tr_ids) // (C * args.K))
+    sched = cosine_lr(opt, args.lr, warmup_length=int(steps_per_epoch * args.epochs * 0.1),
+                      steps=steps_per_epoch * args.epochs)
+
+    best_sig, best_state, bad, step = -1.0, None, 0, 0
+    for epoch in range(args.epochs):
+        model.train()
+        for local in pk_batches(ytr_idx, C, args.K, rng):
+            sched(step); step += 1
+            batch_ids = tr_ids[local]
+            embs = torch.stack([enc_one(model, cache, i, tile) for i in batch_ids])
+            embs = F.normalize(embs, dim=1)
+            y = torch.tensor(ytr_idx[local], device=device)
+            loss = loss_fn(embs, y)
+            opt.zero_grad(); loss.backward(); opt.step()
+        # val retrieval selection
+        Zdb = embed_ids(model, cache, tr_ids, tile)
+        Zva = embed_ids(model, cache, va_ids, tile)
+        m = eval_ranking(cosine_sim(Zva, Zdb), ytr, yva, k=3)
+        sig = 0.5 * (m["acc@1"] + m["acc@3"])
+        print(f"    seed {seed} epoch {epoch:2d}: loss={loss.item():.3f} "
+              f"val Acc@1={m['acc@1']:.4f} Acc@3={m['acc@3']:.4f} sig={sig:.4f}"
+              + ("  *" if sig > best_sig + 1e-4 else ""))
+        if sig > best_sig + 1e-4:
+            best_sig = sig
+            best_state = deepcopy({k: v.detach().cpu() for k, v in
+                                   peft_model.state_dict().items() if "lora_" in k})
+            bad = 0
+        else:
+            bad += 1
+        if bad >= args.patience:
+            print(f"    seed {seed}: early stop at epoch {epoch}")
+            break
+    # restore best adapter
+    peft_model.load_state_dict(best_state, strict=False)
+    model.eval()
+    return best_sig
+
+
+def mode_lora(args):
+    from peft import LoraConfig, get_peft_model
+    meta = load_meta(); tile = meta["tile"]
+    manifest = pd.read_csv(MANIFEST)
+    def split_ids(s):
+        d = manifest[manifest.official_split == s]
+        return list(d.item_id), d.label.values, d.patient_id.values
+    tr_ids, ytr, ctr = split_ids("train")
+    va_ids, yva, cva = split_ids("val")
+    te_ids, yte, cte = split_ids("test")
+    classes = sorted(set(ytr))
+    print(f"[lora] Step 3 Block-LoRA: db={len(tr_ids)} val={len(va_ids)} test={len(te_ids)} "
+          f"r={args.r} alpha={args.alpha} lr={args.lr} epochs={args.epochs} seeds={args.seeds}")
+
+    device = get_device()
+    model, device = load_titan(device)
+    for p in model.parameters():
+        p.requires_grad_(False)
+    targets = block_targets(model)
+    cfg = LoraConfig(r=args.r, lora_alpha=args.alpha, lora_dropout=args.dropout,
+                     target_modules=targets, bias="none")
+    peft_model = get_peft_model(model, cfg)
+    n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"[lora] LoRA on {len(targets)} Linears; trainable params={n_train:,}")
+
+    print("[lora] preloading patch cache to GPU ...")
+    cache = preload_cache(tr_ids + va_ids + te_ids, device)
+
+    # fp32 LoRA-off baseline (paired-test reference; adapter disabled == frozen encoder)
+    with peft_model.disable_adapter():
+        Zdb0 = embed_ids(model, cache, tr_ids, tile)
+        Zte0 = embed_ids(model, cache, te_ids, tile)
+    base_m, base_pc = retrieval_metrics(Zdb0, ytr, ctr, Zte0, yte, cte, "lora-off")
+    base_ok = top1_correct(Zdb0, ytr, Zte0, yte)
+    print(f"[lora] fp32 LoRA-off test: " + " ".join(f"{k}={v:.4f}" for k, v in base_m.items()))
+
+    seeds_out = []
+    for seed in range(args.seeds):
+        print(f"\n[lora] --- seed {seed} ---")
+        best_sig = train_lora(model, peft_model, cache, tr_ids, ytr, ctr, va_ids, yva, cva,
+                              classes, tile, device, seed, args)
+        Zdb = embed_ids(model, cache, tr_ids, tile)
+        Zte = embed_ids(model, cache, te_ids, tile)
+        m, pc = retrieval_metrics(Zdb, ytr, ctr, Zte, yte, cte, f"lora-s{seed}")
+        lora_ok = top1_correct(Zdb, ytr, Zte, yte)
+        paired = paired_bootstrap(base_ok, lora_ok)
+        print(f"[lora] seed {seed} test: " + " ".join(f"{k}={v:.4f}" for k, v in m.items())
+              + f"  | dAcc@1={paired['delta_acc@1']:+.4f} CI{paired['ci95']}")
+        seeds_out.append({"seed": seed, "val_sig": best_sig, "metrics": m,
+                          "per_class_acc@1": pc, "paired_vs_loraoff": paired})
+        # reset adapter to zero for the next seed (fresh init)
+        for n, p in peft_model.named_parameters():
+            if "lora_B" in n:
+                nn.init.zeros_(p)
+            elif "lora_A" in n:
+                nn.init.kaiming_uniform_(p, a=np.sqrt(5))
+
+    keys = list(seeds_out[0]["metrics"])
+    mean = {k: float(np.mean([s["metrics"][k] for s in seeds_out])) for k in keys}
+    std = {k: float(np.std([s["metrics"][k] for s in seeds_out])) for k in keys}
+    print("\n[lora] ===== SUMMARY =====")
+    print(f"[lora] fp32 LoRA-off baseline: " + " ".join(f"{k}={v:.4f}" for k, v in base_m.items()))
+    print(f"[lora] LoRA test mean+/-std:   "
+          + "  ".join(f"{k}={mean[k]:.4f}+/-{std[k]:.4f}" for k in keys))
+    save_results("finetune_bracs_lora_step3.json", {
+        "config": {"r": args.r, "alpha": args.alpha, "dropout": args.dropout, "lr": args.lr,
+                   "epochs": args.epochs, "seeds": args.seeds, "K": args.K, "scope": "block"},
+        "baseline_loraoff_fp32": {"metrics": base_m, "per_class_acc@1": base_pc},
+        "public_baseline_frozen_fp16_acc@1": 0.5053,
+        "per_seed": seeds_out, "test_mean": mean, "test_std": std})
+    print("[lora] Step-3 results saved.")
+    print("[lora] OK")
+
+
 def mode_baseline(args):
     meta = load_meta()
     tile = meta["tile"]
@@ -393,11 +581,22 @@ def mode_baseline(args):
 def main():
     sys.stdout.reconfigure(line_buffering=True)
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--mode", default="baseline", choices=["baseline", "confusion", "control"])
+    ap.add_argument("--mode", default="baseline",
+                    choices=["baseline", "confusion", "control", "lora"])
     ap.add_argument("--dtype", default="fp16", choices=list(DTYPES))
     ap.add_argument("--source", default="both", choices=["frozen", "mean-conch", "both"],
                     help="control mode: which feature space to train the linear map on")
-    ap.add_argument("--seeds", default=3, type=int, help="control mode: number of seeds")
+    ap.add_argument("--seeds", default=3, type=int, help="control/lora: number of seeds")
+    # lora hyperparameters
+    ap.add_argument("--r", default=8, type=int)
+    ap.add_argument("--alpha", default=16, type=int)
+    ap.add_argument("--dropout", default=0.05, type=float)
+    ap.add_argument("--lr", default=2e-4, type=float)
+    ap.add_argument("--wd", default=1e-2, type=float)
+    ap.add_argument("--proxy_mult", default=100.0, type=float)
+    ap.add_argument("--K", default=8, type=int, help="samples per class per PK batch")
+    ap.add_argument("--epochs", default=20, type=int)
+    ap.add_argument("--patience", default=5, type=int)
     args = ap.parse_args()
     if args.mode == "baseline":
         mode_baseline(args)
@@ -405,6 +604,8 @@ def main():
         mode_confusion(args)
     elif args.mode == "control":
         mode_control(args)
+    elif args.mode == "lora":
+        mode_lora(args)
 
 
 if __name__ == "__main__":
