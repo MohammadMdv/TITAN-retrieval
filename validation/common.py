@@ -99,8 +99,32 @@ def load_titan(device=None):
     return model, device
 
 
+def _provenance():
+    """What produced this JSON: enough to tie a number back to the code and box that made it."""
+    import platform
+    import subprocess
+    try:
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=TITAN_ROOT,
+                             capture_output=True, text=True, timeout=5).stdout.strip() or None
+        dirty = bool(subprocess.run(["git", "status", "--porcelain"], cwd=TITAN_ROOT,
+                                    capture_output=True, text=True, timeout=5).stdout.strip())
+    except Exception:
+        sha, dirty = None, None
+    return {
+        "git_sha": sha,
+        "git_dirty": dirty,
+        "argv": sys.argv,
+        "torch": torch.__version__,
+        "cuda": torch.version.cuda,
+        "gpu": torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,
+        "python": platform.python_version(),
+    }
+
+
 def save_results(name, obj):
     path = RESULTS_DIR / name
+    if isinstance(obj, dict):
+        obj = {**obj, "_provenance": _provenance()}
     with open(path, "w") as f:
         json.dump(obj, f, indent=2, default=str)
     print(f"[saved] {path}")

@@ -372,6 +372,21 @@ def block_targets(model):
                  or n.endswith(".mlp.fc1") or n.endswith(".mlp.fc2"))]
 
 
+def reset_lora(peft_model):
+    """Re-init the adapter to PEFT's default state: lora_A ~ kaiming_uniform, lora_B = 0.
+
+    Called at the START of every seed, right after that seed's torch.manual_seed, so seed k's
+    adapter is a pure function of k -- independent of the ambient process RNG and of whatever
+    earlier seeds did. (PEFT does this init inside get_peft_model, which runs before any seeding,
+    so relying on it makes the run unreproducible.)
+    """
+    for n, p in peft_model.named_parameters():
+        if "lora_B" in n:
+            nn.init.zeros_(p)
+        elif "lora_A" in n:
+            nn.init.kaiming_uniform_(p, a=np.sqrt(5))
+
+
 def preload_cache(item_ids, device):
     """All patch features/coords on GPU (fp32, ~85 MB) so per-ROI forwards have no H2D cost."""
     cache = {}
@@ -422,7 +437,6 @@ def train_lora(model, peft_model, cache, tr_ids, ytr, ctr, va_ids, yva, cva, cla
                device, seed, args):
     """Train Block-LoRA + Proxy-Anchor, selecting on val retrieval; keep best-epoch adapter."""
     from copy import deepcopy
-    torch.manual_seed(seed); np.random.seed(seed)
     rng = np.random.default_rng(seed)
     C = len(classes)
     cls_idx = {c: i for i, c in enumerate(classes)}
@@ -489,6 +503,8 @@ def mode_lora(args):
           f"r={args.r} alpha={args.alpha} lr={args.lr} epochs={args.epochs} seeds={args.seeds}")
 
     device = get_device()
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
     model, device = load_titan(device)
     for p in model.parameters():
         p.requires_grad_(False)
@@ -513,6 +529,9 @@ def mode_lora(args):
     seeds_out = []
     for seed in range(args.seeds):
         print(f"\n[lora] --- seed {seed} ---")
+        torch.manual_seed(seed)          # the ONE seeding point for this seed: adapter init,
+        np.random.seed(seed)             # proxy init, LoRA dropout and PK sampling all follow
+        reset_lora(peft_model)           # fresh adapter, drawn from the just-seeded generator
         best_sig = train_lora(model, peft_model, cache, tr_ids, ytr, ctr, va_ids, yva, cva,
                               classes, tile, device, seed, args)
         Zdb = embed_ids(model, cache, tr_ids, tile)
@@ -524,12 +543,6 @@ def mode_lora(args):
               + f"  | dAcc@1={paired['delta_acc@1']:+.4f} CI{paired['ci95']}")
         seeds_out.append({"seed": seed, "val_sig": best_sig, "metrics": m,
                           "per_class_acc@1": pc, "paired_vs_loraoff": paired})
-        # reset adapter to zero for the next seed (fresh init)
-        for n, p in peft_model.named_parameters():
-            if "lora_B" in n:
-                nn.init.zeros_(p)
-            elif "lora_A" in n:
-                nn.init.kaiming_uniform_(p, a=np.sqrt(5))
 
     keys = list(seeds_out[0]["metrics"])
     mean = {k: float(np.mean([s["metrics"][k] for s in seeds_out])) for k in keys}

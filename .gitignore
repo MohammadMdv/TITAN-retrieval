@@ -15,6 +15,7 @@ venv/
 
 # Log captures
 *.out
+*.log
 
 # Tooling scratch / caches
 graphify-out/

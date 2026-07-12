@@ -178,6 +178,8 @@ def main():
         lines = ["## Sub-tasks — harder patient-disjoint TCGA-OT sub-typing", "",
                   "| Task | #cls | test n | LP bacc | Ret Acc@1 | MVAcc@3 |", "|---|---|---|---|---|---|"]
         for name, r in sub.items():
+            if name.startswith("_"):        # _provenance stamp, not a task
+                continue
             lines.append(f"| {name} | {len(r['classes'])} | {r['n']['test']} | "
                          f"{fmt(r['linear_probe'].get('bacc'))} | {fmt(r['retrieval']['acc@1'])} | "
                          f"{fmt(r['retrieval']['mvacc@3'])} |")
